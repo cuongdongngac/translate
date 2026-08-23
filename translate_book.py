@@ -74,6 +74,21 @@ ADDITIONAL_GUIDANCE_TITLE = "addition"   # tên nguồn KHẨN CẤP (tuỳ ch�
 # chỉ cần chạy: python translate_book.py --restart (không cần sửa file nào).
 ANCHOR_PATTERN = re.compile(r'Đã dịch đến hết đoạn/câu:\s*"(.+?)"', re.DOTALL)
 
+# Bắt số % tiến độ AI tự ước lượng trong khối "Ghi chú hệ thống" (ước lượng
+# gần đúng, không cần chính xác tuyệt đối — chỉ để bạn theo dõi cho an tâm).
+PROGRESS_PATTERN = re.compile(r'Tiến độ ước tính trong nguồn hiện tại:\s*(\d{1,3})\s*%')
+
+
+def extract_progress(footer_text):
+    """Trích % tiến độ (nếu có) từ một đoạn footer_text cụ thể."""
+    if not footer_text:
+        return None
+    m = PROGRESS_PATTERN.search(footer_text)
+    if not m:
+        return None
+    value = int(m.group(1))
+    return min(value, 100)   # chặn trên 100% phòng AI ước lượng lệch
+
 
 def get_last_good_anchor():
     """Đọc notes.log, trả về câu neo (trích dẫn tiếng Anh) của vòng THÀNH CÔNG
@@ -125,7 +140,9 @@ Trích dẫn điểm kết thúc đủ dài để tránh nhầm lẫn: Khi tríc
 
 Dịch từ trang đầu tiên có văn bản, không bỏ qua phần mở đầu: Ngay từ lượt "Bắt đầu" đầu tiên, bạn PHẢI bắt đầu dịch từ chính TRANG ĐẦU TIÊN có nội dung văn bản thật sự trong nguồn — bao gồm cả Lời tựa (Preface), Lời giới thiệu (Introduction), Lời cảm ơn (Acknowledgments), Danh mục thuật ngữ/tổ chức được nhắc đến, và mọi phần văn bản khác xuất hiện TRƯỚC Chương 1/Chapter 1. TUYỆT ĐỐI KHÔNG tự ý phán đoán rằng những phần này "không quan trọng" hay "không phải nội dung chính" rồi nhảy thẳng vào Chương 1 — mọi trang có chữ đều phải được dịch tuần tự, kể cả khi đó chỉ là lời cảm ơn hay danh sách tên người. Chỉ được bỏ qua các trang THỰC SỰ không có văn bản (bìa trang trí thuần hình ảnh, bản đồ không chữ, trang trắng).
 
-Không được tìm kiếm internet khi hết nguồn: Khi đã dịch hết toàn bộ nội dung hiện có trong nguồn được cung cấp, TUYỆT ĐỐI KHÔNG cố gắng tìm kiếm, tra cứu, hay mở rộng thông tin từ Internet hoặc bất kỳ nguồn nào khác ngoài (các) nguồn đã được cung cấp trong notebook này — kể cả khi hệ thống có gợi ý hỏi bạn có muốn tìm kiếm internet không, hãy TỪ CHỐI và bỏ qua gợi ý đó. Chỉ cần in dòng chữ HẾT NGUỒN HIỆN TẠI ở đầu câu trả lời (theo đúng quy tắc "Báo hiệu hết nguồn" ở trên) rồi dừng lại ngay lập tức. Không thực hiện bất kỳ hành động nào khác."""
+Không được tìm kiếm internet khi hết nguồn: Khi đã dịch hết toàn bộ nội dung hiện có trong nguồn được cung cấp, TUYỆT ĐỐI KHÔNG cố gắng tìm kiếm, tra cứu, hay mở rộng thông tin từ Internet hoặc bất kỳ nguồn nào khác ngoài (các) nguồn đã được cung cấp trong notebook này — kể cả khi hệ thống có gợi ý hỏi bạn có muốn tìm kiếm internet không, hãy TỪ CHỐI và bỏ qua gợi ý đó. Chỉ cần in dòng chữ HẾT NGUỒN HIỆN TẠI ở đầu câu trả lời (theo đúng quy tắc "Báo hiệu hết nguồn" ở trên) rồi dừng lại ngay lập tức. Không thực hiện bất kỳ hành động nào khác.
+
+Kèm ước lượng tiến độ: Trong khối "Ghi chú hệ thống", NGAY SAU dòng "Đã dịch đến hết đoạn/câu...", thêm đúng một dòng mới theo mẫu: Tiến độ ước tính trong nguồn hiện tại: X% (X là số nguyên từ 0 đến 100). Đây chỉ là ước lượng gần đúng của bạn về vị trí hiện tại so với tổng độ dài nội dung trong nguồn đang được cung cấp (ví dụ dựa theo số trang, số chương, hoặc cảm nhận tổng thể) — không cần chính xác tuyệt đối, chỉ cần là một con số hợp lý giúp người dùng theo dõi tiến độ."""
 
 
 def load_config():
@@ -214,6 +231,7 @@ def load_checkpoint():
         state.setdefault("doc_part_number", 1)      # tương thích ngược cho checkpoint cũ
         state.setdefault("rounds_since_refresh", 0)  # tương thích ngược cho checkpoint cũ
         state.setdefault("last_anchor", None)        # tương thích ngược cho checkpoint cũ
+        state.setdefault("last_progress_percent", None)  # tương thích ngược cho checkpoint cũ
         return state
     return {
         "conversation_id": None,
@@ -226,6 +244,7 @@ def load_checkpoint():
         "doc_part_number": 1,
         "rounds_since_refresh": 0,
         "last_anchor": None,
+        "last_progress_percent": None,
     }
 
 
@@ -503,6 +522,13 @@ async def main():
             if new_anchor:
                 state["last_anchor"] = new_anchor
 
+            # In ra + lưu lại % tiến độ AI tự ước lượng (nếu có) — để bạn theo
+            # dõi mà không cần mở Google Doc kiểm tra liên tục.
+            progress = extract_progress(footer_text)
+            if progress is not None:
+                state["last_progress_percent"] = progress
+                print(f"   -> Tiến độ ước tính trong nguồn hiện tại: {progress}%")
+
             # Lưu checkpoint NGAY sau khi ghi file — đảm bảo translation.md/notes.log
             # và checkpoint.json luôn đồng bộ, KỂ CẢ khi bước đẩy Google Doc bên dưới
             # bị lỗi. Nếu không làm vậy, lỡ bước đẩy Doc crash sẽ khiến checkpoint.json
@@ -604,8 +630,11 @@ async def main():
                 break
 
     if not state["book_finished"] and not state["waiting_for_new_part"]:
+        progress_note = ""
+        if state.get("last_progress_percent") is not None:
+            progress_note = f" (~{state['last_progress_percent']}% nguồn hiện tại)"
         print(
-            f"Xong {state['round']} vòng (đang ở phần {state['part_number']}). "
+            f"Xong {state['round']} vòng (đang ở phần {state['part_number']}){progress_note}. "
             "Chạy lại 'python translate_book.py' để dịch tiếp."
         )
 
