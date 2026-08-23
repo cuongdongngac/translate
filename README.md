@@ -230,6 +230,14 @@ upload theo mục 5 rồi chạy lại) → mở trình duyệt xin quyền Driv
 ```bash
 python translate_book.py
 ```
+Muốn đổi số vòng dịch **chỉ cho lần chạy này** mà không phải mở
+`config.json`, dùng cờ `--rounds`:
+```bash
+python translate_book.py --rounds 15
+```
+Cờ này **ưu tiên hơn** `rounds_per_run` trong `config.json`, đồng thời
+**tự lưu lại** giá trị đó vào `config.json` — lần chạy sau (không dùng cờ
+này) sẽ tự lấy đúng giá trị 15 vừa lưu, không cần gõ lại.
 
 ### 7.2. Khi hết nguồn hiện tại (`HẾT NGUỒN HIỆN TẠI`)
 1. Vào NotebookLM, xoá nguồn PDF hiện tại, thêm file phần tiếp theo.
@@ -264,11 +272,12 @@ sửa lỗi từ vài vòng trước):
    OCR khi trích dẫn — đôi khi khác bản gốc, gây khó định vị chính xác).
 4. `python translate_book.py --restart`.
 
-**Kết hợp cờ:** `--new-part`, `--last-part`, `--restart` dùng chung được,
-không quan trọng thứ tự gõ trên dòng lệnh — ví dụ:
+**Kết hợp cờ:** `--new-part`, `--last-part`, `--restart`, `--rounds` dùng
+chung được, không quan trọng thứ tự gõ trên dòng lệnh — ví dụ:
 ```bash
 python translate_book.py --new-part --restart
 python translate_book.py --new-part --last-part --restart
+python translate_book.py --restart --rounds 3
 ```
 
 ### 7.4. Tự động phục hồi (không cần bạn làm gì)
@@ -296,6 +305,31 @@ các lần chạy sau sẽ tự nhắc AI đọc thêm nguồn đó. Xong việc
 
 `translation.backup.md` luôn giữ "phiên bản tốt cuối cùng" (cập nhật sau
 mỗi vòng thành công) — copy đè lại thành `translation.md` nếu cần khôi phục.
+
+### 7.7. Theo dõi % tiến độ (đỡ sốt ruột)
+
+Sau mỗi vòng dịch thành công, chương trình in ra dòng kiểu:
+```
+   -> Tiến độ ước tính trong nguồn hiện tại: 46%
+```
+và khi thoát, nhắc lại: `Xong 5 vòng (đang ở phần 3) (~46% nguồn hiện tại)`.
+
+> ⚠️ Con số này **do chính AI tự ước lượng** khi viết câu trả lời (script
+> chỉ đọc/trích ra, không tự tính toán/kiểm chứng gì) — coi đây là thước đo
+> **tương đối để yên tâm theo dõi**, không phải phép đo chính xác tuyệt đối
+> (không dựa trên đếm trang PDF thật).
+
+### 7.8. Tổng hợp toàn bộ cờ dòng lệnh
+
+| Cờ | Ý nghĩa |
+|---|---|
+| *(không cờ)* | Dịch tiếp bình thường, theo `rounds_per_run` trong `config.json` |
+| `--rounds N` | Chạy đúng N vòng lần này; tự lưu N làm mặc định mới vào `config.json` |
+| `--new-part` | Báo đã tự đổi nguồn PDF trên NotebookLM, tiếp tục phần mới |
+| `--last-part` | Kết hợp `--new-part`: đây là phần PDF CUỐI CÙNG của sách |
+| `--restart` | "Dịch chỉ định" — xoá hội thoại cũ, tạo hội thoại mới, neo vào `last_anchor` |
+
+Tất cả kết hợp tự do được, không quan trọng thứ tự gõ trên dòng lệnh.
 
 ---
 

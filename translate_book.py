@@ -294,6 +294,14 @@ async def main():
             "mở checkpoint.json, sửa tay trường \"last_anchor\" trước khi chạy lệnh này."
         )
     )
+    parser.add_argument(
+        "--rounds", type=int, default=None, metavar="N",
+        help=(
+            "Số vòng dịch tối đa cho lần chạy này — ƯU TIÊN HƠN rounds_per_run trong "
+            "config.json. Nếu dùng cờ này, giá trị cũng sẽ được LƯU LẠI vào "
+            "config.json, làm mặc định cho các lần chạy sau (khi không dùng cờ này)."
+        )
+    )
     args = parser.parse_args()
 
     state = load_checkpoint()
@@ -364,8 +372,17 @@ async def main():
     notebook_id = config["notebook_id"]
     doc_title = config["doc_title"]
     target_folder_id = config.get("target_folder_id", "")
-    rounds_per_run = config.get("rounds_per_run", 5)
     rounds_before_refresh = config.get("rounds_before_refresh", 0)   # 0 = tắt, không tự làm mới
+
+    if args.rounds is not None:
+        # Cờ --rounds ưu tiên hơn config.json, đồng thời LƯU LẠI làm mặc định mới
+        # cho các lần chạy sau (khi không dùng cờ này) — đỡ phải mở file sửa tay.
+        rounds_per_run = args.rounds
+        config["rounds_per_run"] = args.rounds
+        CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"-> Dùng --rounds {args.rounds} (đã lưu lại vào {CONFIG_FILE} làm mặc định mới).\n")
+    else:
+        rounds_per_run = config.get("rounds_per_run", 5)
 
     print("Đang đăng nhập Google Drive...")
     drive_service = get_drive_service()
