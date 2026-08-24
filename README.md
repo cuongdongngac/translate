@@ -33,6 +33,24 @@ translate_book.py (điều phối vòng lặp, tự phục hồi lỗi)
 
 ---
 
+## 0. Cần biết trước khi dùng
+
+- Đây là quy trình **dịch cuốn chiếu từng đoạn nhỏ** (~300-600 từ/lượt), không
+  phải "upload nguyên cuốn sách rồi bấm một nút là ra bản dịch hoàn chỉnh
+  ngay lập tức". Sách càng dày, càng cần chạy nhiều lượt (`rounds_per_run`).
+- Việc thỉnh thoảng **dừng giữa chừng hoặc báo lỗi** (mất mạng, phiên đăng
+  nhập hết hạn, phản hồi quá dài...) là chuyện **bình thường** của bất kỳ
+  quy trình dịch tự động nào xử lý sách dài — kể cả các công cụ trả phí
+  chuyên nghiệp cũng phải âm thầm xử lý y hệt vậy phía sau, chỉ là họ giấu
+  đi không cho người dùng thấy. Ở đây phần đó hiện rõ ra (vòng lặp, log,
+  `--restart`...) để bạn kiểm soát được, không phải dấu hiệu chương trình
+  bị hỏng.
+- Chương trình đã tự phát hiện và tự phục hồi phần lớn các lỗi thường gặp
+  (xem mục 7.4 và bảng mục 10) — gặp lỗi thì cứ đọc thông báo in ra và làm
+  theo, không cần lo lắng.
+
+---
+
 ## 1. Yêu cầu trước khi bắt đầu
 
 - Một tài khoản Google (dùng cho NotebookLM và Google Drive).
@@ -376,6 +394,44 @@ python split.py sach.pdf 100 10 -o parts
 
 ### 9.2. `latex_to_equation.py` — chuyển LaTeX thành Equation Word thật
 
+Bước này dùng **`pandoc`** — một chương trình cài ở cấp hệ điều hành, **không
+phải** thư viện Python nên `uv pip install` ở mục 2.3 **không** cài được nó.
+Cần cài riêng, **một lần duy nhất** (giống mục 2.1), trước khi chạy lệnh
+`pandoc` bên dưới.
+
+**Cài `pandoc`:**
+
+**Windows (PowerShell hoặc Command Prompt, có sẵn từ Windows 10+):**
+```powershell
+winget install --id JohnMacFarlane.Pandoc
+```
+> Nếu máy không có `winget`, tải bộ cài `.msi` trực tiếp tại
+> [pandoc.org/installing.html](https://pandoc.org/installing.html).
+> Đóng và mở lại terminal sau khi cài để lệnh `pandoc` được nhận.
+
+**macOS (Terminal, cần [Homebrew](https://brew.sh) — cài 1 lần nếu chưa có):**
+```bash
+brew install pandoc
+```
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt update && sudo apt install -y pandoc
+```
+**Linux (Fedora):**
+```bash
+sudo dnf install -y pandoc
+```
+**Linux (Arch):**
+```bash
+sudo pacman -S pandoc
+```
+
+Kiểm tra đã cài đúng:
+```bash
+pandoc --version
+```
+
 Sau khi dịch xong (hoặc định kỳ), chuyển toàn bộ `translation.backup.md`
 (bản đầy đủ, đã đẩy Doc thành công) sang `.docx`:
 ```bash
@@ -402,6 +458,7 @@ python latex_to_equation.py ban_dich_hoan_chinh.docx ban_dich_final.docx
 | Bản dịch bị lặp/nhảy cóc | Hội thoại quá dài, có thể chạm giới hạn context NotebookLM | `python translate_book.py --restart` |
 | Doc mới bị tạo thay vì nối tiếp Doc cũ | `checkpoint.json` bị thiếu (ví dụ chạy từ thư mục mới) | Copy đúng `checkpoint.json` từ thư mục cũ sang |
 | Câu trả lời thiếu khối "📌 Ghi chú hệ thống" | AI trả lời lỗi/cắt cụt giữa chừng | Script tự phục hồi — chỉ cần chạy `--restart` |
+| `pandoc: command not found` / `'pandoc' is not recognized` | Chưa cài `pandoc` cấp hệ điều hành (không nằm trong `requirements.txt`) | Cài theo hướng dẫn ở mục 9.2, sau đó mở lại terminal |
 
 ---
 
@@ -437,4 +494,6 @@ python latex_to_equation.py ban_dich_hoan_chinh.docx ban_dich_final.docx
   ảnh hưởng gì đến kết quả cuối (luôn xuất lại từ `translation.backup.md`
   bằng `pandoc`).
 - **Không cần Docker/máy ảo gì thêm** — `.venv` là đủ cho quy mô dự án này.
+  Ngoại lệ duy nhất là `pandoc` (mục 9.2) — chương trình cấp hệ điều hành,
+  cần cài riêng ngoài `.venv`, chỉ khi bạn dùng bước xuất `.docx`.
 - **Tuyệt đối không dùng `--master-token` với tài khoản Google chính.**
