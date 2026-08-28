@@ -396,265 +396,232 @@ async def main():
 
     print(f"Sẽ dịch tối đa {rounds_per_run} đoạn trong lần chạy này...\n")
 
-    # keepalive=<giây>: tự động "gõ nhẹ" định kỳ trong lúc client mở lâu (nhiều
-    # vòng liên tục), giúp cookie không bị hết hạn giữa chừng — AN TOÀN hơn
-    # nhiều so với master-token (không lưu trữ credential nguy hiểm nào thêm).
-    async with NotebookLMClient.from_storage(keepalive=300) as client:
-        if conversation_id_to_delete:
-            # QUAN TRỌNG: chỉ đặt conversation_id = None KHÔNG đủ để có hội thoại
-            # mới thật sự — thư viện notebooklm-py xác nhận: nếu không gọi
-            # delete_conversation() trước, lần ask() kế tiếp (dù conversation_id
-            # là None) vẫn NỐI TIẾP vào hội thoại cũ, không tách biệt. Xoá thật ở
-            # đây mới đúng như hành động "Delete history" trên giao diện web.
-            try:
-                await client.chat.delete_conversation(notebook_id, conversation_id_to_delete)
-                print(f"-> Đã xoá hội thoại cũ ({conversation_id_to_delete}) trên server — hội thoại mới sẽ tách biệt thật sự.\n")
-            except Exception as e:
-                print(
-                    f"-> Không xoá được hội thoại cũ ({e}) — vẫn tiếp tục với điểm neo, "
-                    "nhưng hội thoại mới CÓ THỂ vẫn nối vào hội thoại cũ thay vì tách biệt.\n"
-                )
+    rounds_completed = 0
 
-        # Kiểm tra 1 lần duy nhất (đầu mỗi lần chạy script) xem có nguồn "addition"
-        # (hiệu chỉnh khẩn cấp) hay không — bạn tự thêm/xoá tay trên NotebookLM khi
-        # cần. Nếu có, mọi câu hỏi gửi đi trong lần chạy này sẽ nhắc AI đọc thêm
-        # nguồn đó. Nếu không có -> bỏ qua hoàn toàn, không ảnh hưởng gì.
-        addition_note = ""
+    while rounds_completed < rounds_per_run:
+        if state.get("book_finished") or state.get("waiting_for_new_part"):
+            break
+
         try:
-            current_sources = await client.sources.list(notebook_id)
-            if any((s.title or "").strip().lower() == ADDITIONAL_GUIDANCE_TITLE for s in current_sources):
-                addition_note = (
-                    f'\n\nLƯU Ý KHẨN CẤP: Notebook này hiện có thêm nguồn "'
-                    f'{ADDITIONAL_GUIDANCE_TITLE}" chứa hướng dẫn hiệu chỉnh bổ sung — '
-                    "hãy đọc kỹ nguồn đó và áp dụng NGAY vào câu trả lời này."
-                )
-                print(f'-> Phát hiện nguồn hiệu chỉnh khẩn cấp "{ADDITIONAL_GUIDANCE_TITLE}" — sẽ nhắc AI đọc thêm.\n')
-        except Exception as e:
-            print(f"-> Không kiểm tra được danh sách nguồn ({e}) — bỏ qua, chạy bình thường.\n")
+            async with NotebookLMClient.from_storage(keepalive=300) as client:
+                if conversation_id_to_delete:
+                    try:
+                        await client.chat.delete_conversation(notebook_id, conversation_id_to_delete)
+                        print(f"-> Đã xoá hội thoại cũ ({conversation_id_to_delete}) trên server — hội thoại mới sẽ tách biệt thật sự.\n")
+                    except Exception as e:
+                        print(f"-> Không xoá được hội thoại cũ ({e})\n")
+                    conversation_id_to_delete = None
 
-        for i in range(rounds_per_run):
-            if restart_anchor and i == 0:
-                # Khôi phục sau lỗi: hội thoại mới tinh, neo rõ vào câu cuối còn đúng.
-                # Trỏ tới 2 nguồn cố định (prompt.txt + automation_rules.txt) thay vì
-                # nhồi lại toàn bộ nội dung luật vào chat -> tránh lỗi "câu hỏi quá dài".
-                question = (
-                    f'Hãy đọc kỹ nguồn "{GUIDE_TITLE}" và nguồn "{AUTOMATION_TITLE}", '
-                    "làm theo ĐÚNG vai trò, quy tắc, định dạng và các luật automation "
-                    "trong 2 nguồn đó để dịch nội dung của (các) nguồn sách khác trong "
-                    "notebook này."
-                    "\n\nLƯU Ý ĐẶC BIỆT (chỉ áp dụng cho ĐÚNG câu trả lời này thôi, "
-                    "không áp dụng cho các lượt 'Tiếp tục' sau này): Đây là một phiên KHÔI "
-                    "PHỤC SAU LỖI. Bạn đang tiếp tục dịch một cuốn sách đã dịch dở, KHÔNG "
-                    f'phải bắt đầu lại từ đầu. Đoạn đã dịch ĐÚNG và được giữ lại kết thúc ở '
-                    f'câu tiếng Anh: "{restart_anchor}". Hãy tiếp tục dịch NGAY SAU câu đó, '
-                    "tuyệt đối không dịch lại bất kỳ nội dung nào trước đó. Sau khi hoàn "
-                    "thành câu trả lời NÀY, hãy quên hẳn hướng dẫn khôi phục này đi — từ "
-                    "lượt 'Tiếp tục' kế tiếp trở đi, chỉ cần tiếp nối ĐÚNG NGAY SAU nội dung "
-                    "bạn vừa dịch ở câu trả lời gần nhất, không quay lại tham chiếu câu neo "
-                    "này nữa.\n\nTiếp tục"
-                )
-                print(f"[{i + 1}/{rounds_per_run}] Gửi lệnh khôi phục (neo vào: \"{restart_anchor[:60]}...\")...")
-            elif state["conversation_id"] is None:
-                # Lần đầu tiên chạy script (file đầu tiên của sách)
-                # Câu hỏi NGẮN, chỉ trỏ tới 2 nguồn cố định (prompt.txt + automation_rules.txt)
-                # bạn đã tự upload — KHÔNG gửi lại toàn bộ nội dung luật qua chat.
-                question = (
-                    f'Hãy đọc kỹ nguồn "{GUIDE_TITLE}" và nguồn "{AUTOMATION_TITLE}", '
-                    "làm theo ĐÚNG vai trò, quy tắc, định dạng và các luật automation "
-                    "trong 2 nguồn đó để dịch nội dung của (các) nguồn sách khác trong "
-                    "notebook này.\n\nBắt đầu"
-                )
-                print(f"[{i + 1}/{rounds_per_run}] Gửi lệnh 'Bắt đầu' (trỏ tới 2 nguồn hướng dẫn)...")
-            elif args.new_part and i == 0:
-                # Vòng đầu tiên sau khi vừa đổi sang file mới
-                question = (
-                    "Tôi vừa chuyển sang phần dữ liệu tiếp theo của cùng cuốn sách "
-                    "(đã xoá phần cũ, thêm nguồn mới). Nếu đầu tài liệu có trang ghi chú "
-                    "báo các trang bị trùng lặp, đừng dịch lại các trang đó, chỉ dùng làm "
-                    "ngữ cảnh. Tiếp tục dịch nối liền mạch từ chỗ dừng trước.\n\nTiếp tục"
-                )
-                print(f"[{i + 1}/{rounds_per_run}] Gửi thông báo CHUYỂN FILE + lệnh 'Tiếp tục'...")
-            else:
-                question = "Tiếp tục"
-                print(f"[{i + 1}/{rounds_per_run}] Gửi lệnh 'Tiếp tục'...")
+                addition_note = ""
+                try:
+                    current_sources = await client.sources.list(notebook_id)
+                    if any((s.title or "").strip().lower() == ADDITIONAL_GUIDANCE_TITLE for s in current_sources):
+                        addition_note = (
+                            f'\n\nLƯU Ý KHẨN CẤP: Notebook này hiện có thêm nguồn "'
+                            f'{ADDITIONAL_GUIDANCE_TITLE}" chứa hướng dẫn hiệu chỉnh bổ sung — '
+                            "hãy đọc kỹ nguồn đó và áp dụng NGAY vào câu trả lời này."
+                        )
+                        print(f'-> Phát hiện nguồn hiệu chỉnh khẩn cấp "{ADDITIONAL_GUIDANCE_TITLE}" — sẽ nhắc AI đọc thêm.\n')
+                except Exception as e:
+                    pass
 
-            question += addition_note   # nhắc thêm nguồn hiệu chỉnh khẩn cấp nếu có (áp dụng mọi loại câu hỏi)
+                while rounds_completed < rounds_per_run:
+                    if state.get("book_finished") or state.get("waiting_for_new_part"):
+                        break
 
-            try:
-                result = await client.chat.ask(
-                    notebook_id,
-                    question,
-                    conversation_id=state["conversation_id"],
-                )
-            except (RPCResponseTooLargeError, NetworkError):
-                print(
-                    "\n⚠️  NotebookLM phản hồi bất thường (quá lớn hoặc mất kết nối giữa chừng).\n"
-                    "Nguyên nhân thường gặp: nguồn đã HẾT, và AI đang cố tìm kiếm internet thay vì\n"
-                    "dừng đúng luật (dù đã cấm trong automation_rules.txt, đôi khi vẫn xảy ra).\n\n"
-                    "Chương trình dừng lại tại đây — KHÔNG có gì bị mất (chưa kịp ghi gì cho vòng này).\n\n"
-                    "Việc cần làm:\n"
-                    f"  1. Mở {LOG_FILE}, kiểm tra câu tiếng Anh cuối cùng đã dịch đúng.\n"
-                    "  2. Đối chiếu với nguồn PDF đang active — có đang gần trang cuối cùng không?\n"
-                    "  3. Nếu đúng là hết nguồn: đổi sang file phần tiếp theo trên NotebookLM, "
-                    "rồi chạy lại với --new-part (hoặc --last-part nếu là phần cuối sách).\n"
-                    f"  4. Nếu không chắc, hoặc hội thoại có thể đã bị lỗi: chạy lại với "
-                    "--restart (dịch chỉ định) để tạo hội thoại mới an toàn.\n"
-                )
-                return
+                    if restart_anchor:
+                        question = (
+                            f'Hãy đọc kỹ nguồn "{GUIDE_TITLE}" và nguồn "{AUTOMATION_TITLE}", '
+                            "làm theo ĐÚNG vai trò, quy tắc, định dạng và các luật automation "
+                            "trong 2 nguồn đó để dịch nội dung của (các) nguồn sách khác trong "
+                            "notebook này."
+                            "\n\nLƯU Ý ĐẶC BIỆT (chỉ áp dụng cho ĐÚNG câu trả lời này thôi, "
+                            "không áp dụng cho các lượt 'Tiếp tục' sau này): Đây là một phiên KHÔI "
+                            "PHỤC SAU LỖI. Bạn đang tiếp tục dịch một cuốn sách đã dịch dở, KHÔNG "
+                            f'phải bắt đầu lại từ đầu. Đoạn đã dịch ĐÚNG và được giữ lại kết thúc ở '
+                            f'câu tiếng Anh: "{restart_anchor}". Hãy tiếp tục dịch NGAY SAU câu đó, '
+                            "tuyệt đối không dịch lại bất kỳ nội dung nào trước đó. Sau khi hoàn "
+                            "thành câu trả lời NÀY, hãy quên hẳn hướng dẫn khôi phục này đi — từ "
+                            "lượt 'Tiếp tục' kế tiếp trở đi, chỉ cần tiếp nối ĐÚNG NGAY SAU nội dung "
+                            "bạn vừa dịch ở câu trả lời gần nhất, không quay lại tham chiếu câu neo "
+                            "này nữa.\n\nTiếp tục"
+                        )
+                        print(f"[{rounds_completed + 1}/{rounds_per_run}] Gửi lệnh khôi phục (neo vào: \"{restart_anchor[:60]}...\")...")
+                        restart_anchor = None
+                    elif state["conversation_id"] is None:
+                        question = (
+                            f'Hãy đọc kỹ nguồn "{GUIDE_TITLE}" và nguồn "{AUTOMATION_TITLE}", '
+                            "làm theo ĐÚNG vai trò, quy tắc, định dạng và các luật automation "
+                            "trong 2 nguồn đó để dịch nội dung của (các) nguồn sách khác trong "
+                            "notebook này.\n\nBắt đầu"
+                        )
+                        print(f"[{rounds_completed + 1}/{rounds_per_run}] Gửi lệnh 'Bắt đầu' (trỏ tới 2 nguồn hướng dẫn)...")
+                    elif args.new_part and rounds_completed == 0:
+                        question = (
+                            "Tôi vừa chuyển sang phần dữ liệu tiếp theo của cùng cuốn sách "
+                            "(đã xoá phần cũ, thêm nguồn mới). Nếu đầu tài liệu có trang ghi chú "
+                            "báo các trang bị trùng lặp, đừng dịch lại các trang đó, chỉ dùng làm "
+                            "ngữ cảnh. Tiếp tục dịch nối liền mạch từ chỗ dừng trước.\n\nTiếp tục"
+                        )
+                        print(f"[{rounds_completed + 1}/{rounds_per_run}] Gửi thông báo CHUYỂN FILE + lệnh 'Tiếp tục'...")
+                    else:
+                        question = "Tiếp tục"
+                        print(f"[{rounds_completed + 1}/{rounds_per_run}] Gửi lệnh 'Tiếp tục'...")
 
-            translation_text, footer_text, part_done, footer_missing = parse_answer(result.answer)
-            if footer_missing:
-                anchor = state.get("last_anchor") or get_last_good_anchor()
-                if anchor:
-                    state["last_anchor"] = anchor
-                    save_checkpoint(state)
-                    print(
-                        f"   ⚠️  Câu trả lời vòng này KHÔNG có khối \"{FOOTER_TEXT_ANCHOR}\" "
-                        "— có thể bị lỗi/cắt cụt giữa chừng. KHÔNG lưu nội dung vòng này "
-                        f"vào {OUTPUT_FILE} (để tránh lẫn nội dung không đáng tin).\n"
-                        "   -> checkpoint.json đã sẵn câu neo đúng gần nhất. Chỉ cần chạy: "
-                        "python translate_book.py --restart\n"
-                    )
-                else:
-                    print(
-                        f"   ⚠️  CẢNH BÁO: câu trả lời vòng này KHÔNG có khối "
-                        f'"{FOOTER_TEXT_ANCHOR}", và không tìm thấy điểm neo cũ nào trong '
-                        f"{LOG_FILE} để tự phục hồi (có thể đây là vòng đầu tiên). Nội "
-                        f"dung vẫn được lưu vào {OUTPUT_FILE} như bình thường — bạn nên "
-                        "mở ra kiểm tra tay đoạn vừa ghi."
-                    )
+                    question += addition_note
+
+                    try:
+                        result = await client.chat.ask(
+                            notebook_id,
+                            question,
+                            conversation_id=state["conversation_id"],
+                        )
+                    except (RPCResponseTooLargeError, NetworkError) as e:
+                        import traceback
+                        error_traceback = traceback.format_exc()
+                        print(
+                            "\n⚠️  NotebookLM phản hồi bất thường (quá lớn hoặc mất kết nối giữa chừng).\n"
+                            f"🔍 CHI TIẾT LỖI (DEBUG): {type(e).__name__} - {str(e)}\n"
+                        )
+                        print("-> TỰ ĐỘNG RESTART LẠI HỘI THOẠI (bảo toàn neo)...\n")
+                        restart_anchor = state.get("last_anchor") or get_last_good_anchor()
+                        if restart_anchor:
+                            conversation_id_to_delete = state["conversation_id"]
+                            state["conversation_id"] = None
+                            state["rounds_since_refresh"] = 0
+                            save_checkpoint(state)
+                            break
+                        else:
+                            print("Không tìm thấy điểm neo để restart! Dừng lại.")
+                            return
+                    except Exception as e:
+                        raise e
+
+                    translation_text, footer_text, part_done, footer_missing = parse_answer(result.answer)
+                    if footer_missing:
+                        anchor = state.get("last_anchor") or get_last_good_anchor()
+                        if anchor:
+                            state["last_anchor"] = anchor
+                            save_checkpoint(state)
+                            print(
+                                f"   ⚠️  Câu trả lời vòng này KHÔNG có khối \"{FOOTER_TEXT_ANCHOR}\" "
+                                "— có thể bị lỗi/cắt cụt giữa chừng. KHÔNG lưu nội dung vòng này "
+                                f"vào {OUTPUT_FILE} (để tránh lẫn nội dung không đáng tin).\n"
+                                "   -> TỰ ĐỘNG RESTART LẠI HỘI THOẠI (bảo toàn neo)...\n"
+                            )
+                            restart_anchor = anchor
+                            conversation_id_to_delete = state["conversation_id"]
+                            state["conversation_id"] = None
+                            state["rounds_since_refresh"] = 0
+                            break
+                        else:
+                            print(
+                                f"   ⚠️  CẢNH BÁO: câu trả lời vòng này KHÔNG có khối "
+                                f'"{FOOTER_TEXT_ANCHOR}", và không tìm thấy điểm neo cũ nào trong '
+                                f"{LOG_FILE} để tự phục hồi. Nội dung vẫn được lưu vào {OUTPUT_FILE}."
+                            )
+                            append_translation(translation_text)
+                            return
+
+                    state["conversation_id"] = result.conversation_id
+                    state["round"] += 1
+                    rounds_completed += 1
+
                     append_translation(translation_text)
-                return
+                    append_log(footer_text, translation_text)
 
-            state["conversation_id"] = result.conversation_id
-            state["round"] += 1
+                    new_anchor = extract_anchor(footer_text)
+                    if new_anchor:
+                        state["last_anchor"] = new_anchor
 
-            append_translation(translation_text)
-            append_log(footer_text, translation_text)
+                    progress = extract_progress(footer_text)
+                    if progress is not None:
+                        state["last_progress_percent"] = progress
+                        print(f"   -> Tiến độ ước tính trong nguồn hiện tại: {progress}%")
 
-            # Tự động cập nhật câu neo mới nhất vào checkpoint.json sau MỖI vòng
-            # thành công — sẵn sàng dùng ngay cho lần "--restart" tiếp theo nếu
-            # cần, không phải tự tìm/copy trong notes.log nữa.
-            new_anchor = extract_anchor(footer_text)
-            if new_anchor:
-                state["last_anchor"] = new_anchor
-
-            # In ra + lưu lại % tiến độ AI tự ước lượng (nếu có) — để bạn theo
-            # dõi mà không cần mở Google Doc kiểm tra liên tục.
-            progress = extract_progress(footer_text)
-            if progress is not None:
-                state["last_progress_percent"] = progress
-                print(f"   -> Tiến độ ước tính trong nguồn hiện tại: {progress}%")
-
-            # Lưu checkpoint NGAY sau khi ghi file — đảm bảo translation.md/notes.log
-            # và checkpoint.json luôn đồng bộ, KỂ CẢ khi bước đẩy Google Doc bên dưới
-            # bị lỗi. Nếu không làm vậy, lỡ bước đẩy Doc crash sẽ khiến checkpoint.json
-            # "tụt lại phía sau" so với nội dung đã ghi thật trong translation.md.
-            save_checkpoint(state)
-
-            # Nội dung SẼ đẩy lên Doc hiện tại: từ doc_offset (điểm bắt đầu của
-            # Doc đang active) đến hết file. Nếu đoạn này đã gần chạm giới hạn
-            # cứng 1.024.000 ký tự của Google Docs, chốt lại Doc cũ (không đẩy
-            # thêm vào đó nữa) và mở một Doc "Phần N" mới, bắt đầu từ đây.
-            full_content = OUTPUT_FILE.read_text(encoding="utf-8")
-            doc_offset = state.get("doc_offset", 0)
-            segment = full_content[doc_offset:]
-
-            is_new_doc = state["doc_id"] is None
-            if state["doc_id"] is not None and len(segment) > DOC_SAFE_CHAR_LIMIT:
-                state["doc_part_number"] = state.get("doc_part_number", 1) + 1
-                doc_offset = len(full_content) - len(translation_text) - 2  # trừ đoạn vừa thêm (kèm 2 dòng trắng)
-                doc_offset = max(doc_offset, 0)
-                segment = full_content[doc_offset:]
-                is_new_doc = True
-                state["doc_id"] = None
-                print(
-                    f"   -> Google Doc hiện tại đã gần đầy (giới hạn Google Docs là "
-                    f"1.024.000 ký tự) — tự động mở Doc PHẦN {state['doc_part_number']} mới."
-                )
-
-            part_doc_title = doc_title if state.get("doc_part_number", 1) == 1 else (
-                f"{doc_title} (Phần {state['doc_part_number']})"
-            )
-
-            # Bọc riêng bước đẩy Google Doc — nếu lỗi (mạng, quyền, vượt giới hạn...),
-            # KHÔNG để crash toàn bộ script. translation.md/notes.log/checkpoint.json
-            # đã lưu đúng và đồng bộ ở trên rồi, nên có thể dừng lại an toàn, chạy lại
-            # sau — lần chạy tới sẽ TỰ ĐỘNG thử đẩy lại đúng đoạn còn thiếu (vì
-            # doc_offset vẫn chưa được cập nhật, segment sẽ tự bao gồm đủ phần chưa đẩy).
-            try:
-                new_doc_id = push_markdown_to_doc(
-                    drive_service, state["doc_id"], part_doc_title, target_folder_id, segment
-                )
-            except Exception as e:
-                print(
-                    f"\n⚠️  Đẩy lên Google Doc bị lỗi: {e}\n"
-                    "Bản dịch của vòng này ĐÃ được lưu an toàn vào "
-                    f"{OUTPUT_FILE} và {LOG_FILE}, checkpoint cũng đã cập nhật đúng "
-                    "— KHÔNG mất gì cả.\n"
-                    "Chạy lại bình thường: chương trình sẽ tự động thử đẩy lại đúng "
-                    "phần còn thiếu lên Google Doc trước khi dịch tiếp.\n"
-                )
-                return
-
-            state["doc_id"] = new_doc_id
-            state["doc_offset"] = doc_offset
-            save_checkpoint(state)
-
-            # Sao lưu "phiên bản tốt cuối cùng" — nếu sau này bạn lỡ xoá/cắt quá
-            # tay translation.md khi chuẩn bị dịch chỉ định, vẫn còn bản này để khôi phục.
-            BACKUP_FILE.write_text(full_content, encoding="utf-8")
-
-            doc_link = f"https://docs.google.com/document/d/{state['doc_id']}/edit"
-
-            if is_new_doc:
-                with DOC_LINK_FILE.open("a", encoding="utf-8") as f:
-                    f.write(f"Phần {state.get('doc_part_number', 1)}: {doc_link}\n")
-                print(f"   -> Đã tạo Google Doc mới: {doc_link}")
-                print(f"      (link này cũng được lưu vào {DOC_LINK_FILE}, mở lại bất cứ lúc nào)")
-            else:
-                print(f"   -> xong ({len(translation_text)} ký tự đã đẩy lên Google Doc)")
-
-            # Chủ động làm mới hội thoại định kỳ (nếu bật rounds_before_refresh > 0
-            # trong config.json) — phòng ngừa hội thoại quá dài gây lộn xộn/lỗi,
-            # thay vì đợi đến khi thực sự xảy ra sự cố mới xử lý.
-            state["rounds_since_refresh"] = state.get("rounds_since_refresh", 0) + 1
-            if rounds_before_refresh > 0 and state["rounds_since_refresh"] >= rounds_before_refresh:
-                if state.get("last_anchor"):
                     save_checkpoint(state)
-                    print(
-                        f"\n-> Đã dịch được {state['rounds_since_refresh']} vòng liên tục trong "
-                        "cùng 1 hội thoại — chủ động làm mới để phòng ngừa hội thoại quá dài.\n"
-                        "checkpoint.json đã sẵn câu neo đúng vừa dịch xong. Chỉ cần chạy: "
-                        "python translate_book.py --restart\n"
+
+                    full_content = OUTPUT_FILE.read_text(encoding="utf-8")
+                    doc_offset = state.get("doc_offset", 0)
+                    segment = full_content[doc_offset:]
+
+                    is_new_doc = state["doc_id"] is None
+                    if state["doc_id"] is not None and len(segment) > DOC_SAFE_CHAR_LIMIT:
+                        state["doc_part_number"] = state.get("doc_part_number", 1) + 1
+                        doc_offset = len(full_content) - len(translation_text) - 2
+                        doc_offset = max(doc_offset, 0)
+                        segment = full_content[doc_offset:]
+                        is_new_doc = True
+                        state["doc_id"] = None
+                        print(f"   -> Google Doc hiện tại đã gần đầy — tự động mở Doc PHẦN {state['doc_part_number']} mới.")
+
+                    part_doc_title = doc_title if state.get("doc_part_number", 1) == 1 else (
+                        f"{doc_title} (Phần {state['doc_part_number']})"
                     )
-                    return
 
-            if part_done:
-                if args.last_part:
-                    state["book_finished"] = True
-                    save_checkpoint(state)
-                    print("HOÀN TẤT: Đã dịch xong TOÀN BỘ sách (đây là file cuối cùng)!")
-                else:
-                    state["waiting_for_new_part"] = True
-                    save_checkpoint(state)
-                    print(
-                        f"Đã dịch xong hết nội dung phần {state['part_number']}.\n"
-                        "=> Vào web NotebookLM: xoá nguồn hiện tại, thêm file phần tiếp theo.\n"
-                        "=> Rồi chạy lại: python translate_book.py --new-part\n"
-                        "   (thêm --last-part nếu đó là file cuối cùng của sách)"
-                    )
-                break
+                    try:
+                        new_doc_id = push_markdown_to_doc(
+                            drive_service, state["doc_id"], part_doc_title, target_folder_id, segment
+                        )
+                        state["doc_id"] = new_doc_id
+                        state["doc_offset"] = doc_offset
+                        save_checkpoint(state)
+                        BACKUP_FILE.write_text(full_content, encoding="utf-8")
 
-    if not state["book_finished"] and not state["waiting_for_new_part"]:
+                        doc_link = f"https://docs.google.com/document/d/{state['doc_id']}/edit"
+                        if is_new_doc:
+                            with DOC_LINK_FILE.open("a", encoding="utf-8") as f:
+                                f.write(f"Phần {state.get('doc_part_number', 1)}: {doc_link}\n")
+                            print(f"   -> Đã tạo Google Doc mới: {doc_link}")
+                        else:
+                            print(f"   -> xong ({len(translation_text)} ký tự đã đẩy lên Google Doc)")
+                    except Exception as e:
+                        print(f"\n⚠️  Đẩy lên Google Doc bị lỗi: {e}\nBản dịch vẫn lưu an toàn nội bộ.\n")
+
+                    state["rounds_since_refresh"] = state.get("rounds_since_refresh", 0) + 1
+                    if rounds_before_refresh > 0 and state["rounds_since_refresh"] >= rounds_before_refresh:
+                        if state.get("last_anchor"):
+                            print("\n-> Tự động làm mới hội thoại định kỳ (giữ nguyên câu neo)...")
+                            restart_anchor = state.get("last_anchor")
+                            conversation_id_to_delete = state["conversation_id"]
+                            state["conversation_id"] = None
+                            state["rounds_since_refresh"] = 0
+                            save_checkpoint(state)
+                            break
+
+                    if part_done:
+                        if args.last_part:
+                            state["book_finished"] = True
+                            save_checkpoint(state)
+                            print("HOÀN TẤT: Đã dịch xong TOÀN BỘ sách (đây là file cuối cùng)!")
+                        else:
+                            state["waiting_for_new_part"] = True
+                            save_checkpoint(state)
+                            print(
+                                f"Đã dịch xong hết nội dung phần {state['part_number']}.\n"
+                                "=> Vào web NotebookLM: xoá nguồn hiện tại, thêm file phần tiếp theo.\n"
+                                "=> Rồi chạy lại: python translate_book.py --new-part\n"
+                                "   (thêm --last-part nếu đó là file cuối cùng của sách)"
+                            )
+                        break
+
+        except Exception as e:
+            print(f"\n⚠️ Lỗi kết nối hoặc xác thực: {e}")
+            print("-> Tự động gọi login.bat để thử relogin...")
+            import subprocess
+            subprocess.run(["login.bat"], shell=True)
+            print("-> Đã relogin, đang thử lại...\n")
+            import time
+            time.sleep(2)
+
+    if not state.get("book_finished") and not state.get("waiting_for_new_part"):
         progress_note = ""
         if state.get("last_progress_percent") is not None:
             progress_note = f" (~{state['last_progress_percent']}% nguồn hiện tại)"
         print(
-            f"Xong {state['round']} vòng (đang ở phần {state['part_number']}){progress_note}. "
+            f"Xong {state.get('round')} vòng (đang ở phần {state.get('part_number')}){progress_note}. "
             "Chạy lại 'python translate_book.py' để dịch tiếp."
         )
-
 
 if __name__ == "__main__":
     asyncio.run(main())

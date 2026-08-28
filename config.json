@@ -1,6 +1,7 @@
 {
   "notebook_id": "34cb192b-a79c-41d6-be5c-dd499f1bdda2",
-  "doc_title": "The Socialist System The Political Economy Of Communism",
+  "doc_title": "Essentials of Epidemiology in Public Health",
   "target_folder_id": "1SS-Y00zpS2VTM2HwnVQ965TjqWCZrRk3",
-  "rounds_per_run": 30
+  "rounds_per_run": 3000,
+  "rounds_before_refresh": 15
 }
