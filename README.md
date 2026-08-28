@@ -10,20 +10,20 @@ dung lượng).
 
 **Vận hành bán tự động có chủ đích:** bạn tự tay thêm/xoá nguồn PDF trên
 NotebookLM; chương trình lo phần lặp lại (gõ "Bắt đầu"/"Tiếp tục" thay bạn,
-đẩy kết quả lên Doc, tự phát hiện và phục hồi một số lỗi thường gặp). Việc
+đẩy kết quả lên Doc, **tự động làm mới hội thoại**, **tự động lấy lại token đăng nhập khi hết hạn**, và tự phục hồi một số lỗi thường gặp). Việc
 đổi nguồn bằng tay đóng vai trò "trạm kiểm tra chất lượng" — giúp phát hiện
-sớm nếu AI dịch lệch hướng.
+sớm nếu AI dịch lệch hướng. Chạy vô số vòng liên tục (ví dụ 9999) qua đêm một cách ổn định!
 
 ### Sơ đồ luồng hoạt động
 
-```
+```text
 PDF sách (bạn tự upload lên NotebookLM)
         │
         ▼
 NotebookLM (dịch từng đoạn, theo lệnh "Bắt đầu"/"Tiếp tục")
         │
         ▼
-translate_book.py (điều phối vòng lặp, tự phục hồi lỗi)
+translate_book.py (điều phối vòng lặp, tự làm mới hội thoại định kỳ, tự relogin)
         │
         ├──► translation.md   (bản dịch đầy đủ — NGUỒN DỮ LIỆU THẬT)
         │
@@ -38,16 +38,11 @@ translate_book.py (điều phối vòng lặp, tự phục hồi lỗi)
 - Đây là quy trình **dịch cuốn chiếu từng đoạn nhỏ** (~300-600 từ/lượt), không
   phải "upload nguyên cuốn sách rồi bấm một nút là ra bản dịch hoàn chỉnh
   ngay lập tức". Sách càng dày, càng cần chạy nhiều lượt (`rounds_per_run`).
-- Việc thỉnh thoảng **dừng giữa chừng hoặc báo lỗi** (mất mạng, phiên đăng
+- Việc thỉnh thoảng **bị lỗi API** (mất mạng, phiên đăng
   nhập hết hạn, phản hồi quá dài...) là chuyện **bình thường** của bất kỳ
-  quy trình dịch tự động nào xử lý sách dài — kể cả các công cụ trả phí
-  chuyên nghiệp cũng phải âm thầm xử lý y hệt vậy phía sau, chỉ là họ giấu
-  đi không cho người dùng thấy. Ở đây phần đó hiện rõ ra (vòng lặp, log,
-  `--restart`...) để bạn kiểm soát được, không phải dấu hiệu chương trình
-  bị hỏng.
-- Chương trình đã tự phát hiện và tự phục hồi phần lớn các lỗi thường gặp
-  (xem mục 7.4 và bảng mục 10) — gặp lỗi thì cứ đọc thông báo in ra và làm
-  theo, không cần lo lắng.
+  quy trình dịch tự động nào. Ở phiên bản hiện tại, chương trình đã tự động
+  phát hiện và khắc phục các vấn đề này ngầm, giúp bạn hoàn toàn an tâm "cắm máy đi ngủ".
+- Đã có thực nghiệm dịch liên tục hàng trăm trang sách mà không cần tương tác người dùng.
 
 ---
 
@@ -95,9 +90,7 @@ mkdir ~/book-translate
 cd ~/book-translate
 ```
 
-Đặt toàn bộ file dự án (`translate_book.py`, `config.example.json`,
-`requirements.txt`, `.gitignore`, `split.py`, `latex_to_equation.py`) vào
-đúng thư mục này.
+Đặt toàn bộ file dự án vào đúng thư mục này.
 
 ### 2.3. Tạo môi trường ảo và cài thư viện
 
@@ -129,23 +122,24 @@ Nếu thiếu trình duyệt khi đăng nhập lần đầu:
 uv tool run playwright install chromium
 ```
 
-### 2.5. Đăng nhập NotebookLM
+### 2.5. Tạo file `login.bat` và Đăng nhập NotebookLM lần đầu
 
+Tạo file có tên `login.bat` (hoặc `login.sh` trên Mac/Linux nếu muốn) trong thư mục dự án, nội dung chỉ gồm đúng lệnh sau:
+```bat
+notebooklm login
+```
+
+Chạy file này hoặc gõ lệnh trực tiếp:
 ```bash
 notebooklm login
 ```
-Trình duyệt tự mở để đăng nhập. Kiểm tra lại:
+Trình duyệt tự mở để đăng nhập. Sau lần đăng nhập đầu tiên này, token sẽ được lưu lại. Về sau, khi gọi `notebooklm login`, hệ thống sẽ **âm thầm tự động cấp lại cookie/token** mà không bắt bạn click trình duyệt nữa (rất phù hợp để chạy nền tự động).
+
+Kiểm tra lại:
 ```bash
 notebooklm auth check --test --json
 ```
 Thấy `"status": "ok"` là thành công.
-
-> 🔒 **Cảnh báo bảo mật:** thư viện có tuỳ chọn `--master-token` để tránh
-> phải đăng nhập lại — **KHÔNG dùng với tài khoản Google chính của bạn**.
-> Tài liệu chính thức của thư viện gọi đây là *"infostealer-grade"* (mức độ
-> nguy hiểm tương đương mã độc đánh cắp tài khoản), tồn tại vĩnh viễn kể cả
-> sau khi đổi mật khẩu. Chỉ dùng với tài khoản Google "dùng bỏ", không quan
-> trọng. Xem mục 8 để biết cách an toàn hơn tránh hết hạn phiên đăng nhập.
 
 ---
 
@@ -185,21 +179,20 @@ Cần lấy **một lần duy nhất**, dùng chung cho mọi cuốn sách sau n
 
 ### 4.1. `config.json`
 
-Copy `config.example.json` thành `config.json`:
+Copy `config.example.json` thành `config.json` (phải đảm bảo chuẩn JSON, chú ý dấu phẩy):
 ```json
 {
   "notebook_id": "id-notebook-lấy-từ-lệnh-notebooklm-list",
   "doc_title": "Tên hiển thị cho Google Doc",
   "target_folder_id": "",
-  "rounds_per_run": 5,
-  "rounds_before_refresh": 0
+  "rounds_per_run": 9999,
+  "rounds_before_refresh": 15
 }
 ```
 - `notebook_id`: chạy `notebooklm list` để xem.
 - `target_folder_id`: để trống nếu không cần đặt Doc vào thư mục Drive cụ thể.
-- `rounds_per_run`: số đoạn dịch tối đa mỗi lần chạy lệnh (khuyên 5 lúc mới bắt đầu).
-- `rounds_before_refresh`: (tuỳ chọn) sau bao nhiêu vòng thì **chủ động** làm
-  mới hội thoại để phòng ngừa hội thoại quá dài gây lỗi — `0` = tắt.
+- `rounds_per_run`: số đoạn dịch tối đa mỗi lần chạy lệnh (có thể set thật to như `9999` để máy cắm qua đêm).
+- `rounds_before_refresh`: **CỰC KỲ QUAN TRỌNG**. Nên để `15` hoặc `20`. Tức là sau 15 vòng, kịch bản sẽ tự động xoá hội thoại cũ rác rưởi đi, lập hội thoại mới tinh trên máy chủ Google (nhưng bảo toàn nguyên vị trí dịch hiện tại) để tránh lỗi tràn context.
 
 ### 4.2. `prompt.txt` — viết riêng, KHÔNG đặt trong thư mục dự án
 
@@ -210,9 +203,7 @@ heading/bold/bảng markdown, công thức LaTeX bọc `\[...\]`/`\(...\)`...).
 ### 4.3. `automation_rules.txt` — tự sinh, chỉ cần upload
 
 Chạy chương trình lần đầu (mục 6) — nó tự ghi ra file này. Đây là các luật
-"hệ thống" áp dụng mọi cuốn sách: báo hiệu hết nguồn, xử lý trang gối đầu,
-không chèn số trích dẫn, tự soát nội dung ngoài phạm vi sách, không tự ý
-tìm internet khi hết nguồn...
+"hệ thống" áp dụng mọi cuốn sách.
 
 ---
 
@@ -244,18 +235,15 @@ upload theo mục 5 rồi chạy lại) → mở trình duyệt xin quyền Driv
 
 ## 7. Vận hành hàng ngày
 
-### 7.1. Dịch tiếp bình thường
+### 7.1. Dịch tiếp bình thường & Cắm qua đêm
 ```bash
 python translate_book.py
 ```
-Muốn đổi số vòng dịch **chỉ cho lần chạy này** mà không phải mở
-`config.json`, dùng cờ `--rounds`:
+Muốn cắm máy dịch liên tục, bạn gõ luôn số vòng lớn:
 ```bash
-python translate_book.py --rounds 15
+python translate_book.py --rounds 9999
 ```
-Cờ này **ưu tiên hơn** `rounds_per_run` trong `config.json`, đồng thời
-**tự lưu lại** giá trị đó vào `config.json` — lần chạy sau (không dùng cờ
-này) sẽ tự lấy đúng giá trị 15 vừa lưu, không cần gõ lại.
+Chương trình sẽ hoạt động miệt mài. Khi gặp lỗi mạng hoặc token hết hạn, nó **tự động gọi file `login.bat` để phục hồi** và chạy tiếp mà không cần bạn can thiệp.
 
 ### 7.2. Khi hết nguồn hiện tại (`HẾT NGUỒN HIỆN TẠI`)
 1. Vào NotebookLM, xoá nguồn PDF hiện tại, thêm file phần tiếp theo.
@@ -264,119 +252,41 @@ này) sẽ tự lấy đúng giá trị 15 vừa lưu, không cần gõ lại.
    ```
    Thêm `--last-part` nếu đó là phần cuối sách.
 
-### 7.3. "Dịch chỉ định" (`--restart`) — làm mới hội thoại
+### 7.3. "Dịch chỉ định" (`--restart`) — làm mới hội thoại bằng tay
 
-Dùng khi: lỗi mạng/phản hồi bất thường, hội thoại quá dài gây lặp/nhảy
-cóc, hoặc muốn sửa lại một đoạn dịch sai.
+Mặc dù hệ thống đã có tính năng tự động làm mới hội thoại, nhưng nếu bạn muốn ép làm mới thủ công (ví dụ cần sửa lại một đoạn dịch sai từ nhiều ngày trước), dùng cờ:
 
 ```bash
 python translate_book.py --restart
 ```
-Script tự động:
-- Lấy câu neo (tiếng Anh) từ trường `last_anchor` trong `checkpoint.json`
-  — **tự cập nhật sau mỗi vòng thành công**, không cần bạn tự tìm/copy.
-- **Xoá hội thoại cũ trên server** (giống bấm "Delete history" trên web) rồi
-  tạo hội thoại hoàn toàn mới, neo đúng vào câu đó — tránh mang theo gánh
-  nặng ngữ cảnh (context) cũ.
-
-**Muốn neo vào một điểm CŨ hơn** (không phải điểm vừa dịch xong, ví dụ cần
-sửa lỗi từ vài vòng trước):
+**Muốn neo vào một điểm CŨ hơn** (để dịch lại đoạn lỗi):
 1. Mở `notes.log`, tìm câu tiếng Anh đúng + đoạn tiếng Việt tương ứng của
    vòng muốn quay về.
 2. Mở `translation.md`, dùng đoạn tiếng Việt đó để Ctrl+F tìm đúng vị trí,
-   xoá phần phía sau (hoặc dán `<!-- CUT_HERE -->` tại đó — script tự cắt).
+   xoá phần phía sau.
 3. Mở `checkpoint.json`, sửa trường `"last_anchor"` = đúng câu tiếng Anh
-   (nên lấy **nguyên văn từ PDF gốc**, không dùng câu AI tự "làm sạch" lỗi
-   OCR khi trích dẫn — đôi khi khác bản gốc, gây khó định vị chính xác).
-4. `python translate_book.py --restart`.
+   (lấy nguyên văn từ PDF gốc).
+4. Chạy `python translate_book.py --restart`.
 
-**Kết hợp cờ:** `--new-part`, `--last-part`, `--restart`, `--rounds` dùng
-chung được, không quan trọng thứ tự gõ trên dòng lệnh — ví dụ:
-```bash
-python translate_book.py --new-part --restart
-python translate_book.py --new-part --last-part --restart
-python translate_book.py --restart --rounds 3
-```
+### 7.4. Tự động phục hồi cực mạnh (Không cần bạn làm gì)
 
-### 7.4. Tự động phục hồi (không cần bạn làm gì)
-
-- **Thiếu khối "📌 Ghi chú hệ thống"**: nếu câu trả lời AI bị lỗi/cắt cụt và
-  thiếu hẳn phần ghi chú kết thúc, script **tự động** không lưu nội dung
-  đáng ngờ đó, tự cập nhật `last_anchor` về điểm đúng gần nhất, và báo bạn
-  chỉ cần chạy `--restart`.
-- **Phản hồi quá lớn / mất mạng** (`RPCResponseTooLargeError`,
-  `NetworkError`): script dừng gọn gàng, không mất gì (chưa kịp ghi gì cho
-  vòng đó) — thường chỉ cần chạy lại bình thường; nếu lặp lại, dùng `--restart`.
-- **Google Doc gần chạm giới hạn 1.024.000 ký tự**: script tự động chốt
-  Doc hiện tại, mở **Doc "Phần N" mới** liền mạch, ghi thêm dòng mới vào
-  `google_doc_link.txt` — không cần bạn can thiệp.
+- **Làm mới hội thoại định kỳ (Chống tràn context)**: Khi đạt đủ số `rounds_before_refresh`, script tự xoá hội thoại cũ, tạo hội thoại mới, nhồi câu neo tiếng Anh mới nhất vào. Dịch mượt mà tiếp tục.
+- **Tự động đăng nhập lại (Auto-Relogin)**: Khi chạy đêm dài, cookie đăng nhập Google có thể hết hạn. Mã nguồn tự nhận diện các lỗi này, âm thầm gọi `login.bat` (chạy `notebooklm login` trong background) để gia hạn token và dịch tiếp.
+- **Phản hồi quá lớn** (`RPCResponseTooLargeError`): Khi NotebookLM cố search mạng vì cạn nguồn, script tự động kích hoạt tiến trình RESTART để phục hồi. 
+- **Google Doc gần chạm giới hạn 1.024.000 ký tự**: Script tự mở Doc "Phần N" mới nối tiếp.
 
 ### 7.5. Hiệu chỉnh khẩn cấp — nguồn `addition` (tuỳ chọn)
 
-Khi cần chỉnh gấp mà không muốn sửa `prompt.txt`/`automation_rules.txt`
-chính thức: vào NotebookLM → **Add source → Paste text** → viết hướng dẫn
-cần thiết → đặt tên nguồn đúng là **`addition`**. Mọi câu hỏi gửi đi trong
-các lần chạy sau sẽ tự nhắc AI đọc thêm nguồn đó. Xong việc, xoá nguồn đó đi
-— lần chạy tiếp theo tự động không còn nhắc đến nữa, không cần sửa gì khác.
-
-### 7.6. Nếu chương trình lỡ ghi sai vào `translation.md`
-
-`translation.backup.md` luôn giữ "phiên bản tốt cuối cùng" (cập nhật sau
-mỗi vòng thành công) — copy đè lại thành `translation.md` nếu cần khôi phục.
-
-### 7.7. Theo dõi % tiến độ (đỡ sốt ruột)
-
-Sau mỗi vòng dịch thành công, chương trình in ra dòng kiểu:
-```
-   -> Tiến độ ước tính trong nguồn hiện tại: 46%
-```
-và khi thoát, nhắc lại: `Xong 5 vòng (đang ở phần 3) (~46% nguồn hiện tại)`.
-
-> ⚠️ Con số này **do chính AI tự ước lượng** khi viết câu trả lời (script
-> chỉ đọc/trích ra, không tự tính toán/kiểm chứng gì) — coi đây là thước đo
-> **tương đối để yên tâm theo dõi**, không phải phép đo chính xác tuyệt đối
-> (không dựa trên đếm trang PDF thật).
-
-### 7.8. Tổng hợp toàn bộ cờ dòng lệnh
-
-| Cờ | Ý nghĩa |
-|---|---|
-| *(không cờ)* | Dịch tiếp bình thường, theo `rounds_per_run` trong `config.json` |
-| `--rounds N` | Chạy đúng N vòng lần này; tự lưu N làm mặc định mới vào `config.json` |
-| `--new-part` | Báo đã tự đổi nguồn PDF trên NotebookLM, tiếp tục phần mới |
-| `--last-part` | Kết hợp `--new-part`: đây là phần PDF CUỐI CÙNG của sách |
-| `--restart` | "Dịch chỉ định" — xoá hội thoại cũ, tạo hội thoại mới, neo vào `last_anchor` |
-
-Tất cả kết hợp tự do được, không quan trọng thứ tự gõ trên dòng lệnh.
+Khi cần chỉnh gấp mà không muốn sửa `prompt.txt`/`automation_rules.txt`: vào NotebookLM → **Add source → Paste text** → viết hướng dẫn
+cần thiết → đặt tên nguồn đúng là **`addition`**. Chạy xong xoá nó đi.
 
 ---
 
-## 8. Tránh hết hạn phiên đăng nhập khi chạy dài (an toàn, khuyên dùng)
+## 8. Tránh hết hạn phiên đăng nhập (ĐÃ TỰ ĐỘNG HOÁ)
 
-Code đã bật sẵn `keepalive=300` khi mở client — tự "gõ nhẹ" định kỳ trong
-lúc chạy để cookie không hết hạn giữa chừng. Muốn chắc chắn hơn nữa (kể cả
-lúc không chạy script), đặt lịch tự làm mới phiên định kỳ:
+Trước đây người dùng cần cài Task Scheduler, Crontab hay dùng các mẹo `--master-token` nguy hiểm. **Hiện tại việc này là không cần thiết nữa!**
 
-**Bước 1 — tìm đường dẫn `notebooklm`:**
-```bash
-# Windows
-where notebooklm
-# macOS/Linux
-which notebooklm
-```
-
-**Bước 2 — đặt lịch chạy** (`notebooklm auth refresh --quiet`) mỗi 15-20 phút:
-- **Windows**: dùng **Task Scheduler** → Create Task → Trigger: On a
-  schedule, Repeat task every 15 minutes, Indefinitely → Action: Start a
-  program, Program/script = đường dẫn tìm được ở Bước 1, Add arguments =
-  `auth refresh --quiet` → tick "Run whether user is logged on or not".
-- **macOS/Linux**: thêm dòng sau vào crontab (`crontab -e`):
-  ```
-  */15 * * * * /đường/dẫn/notebooklm auth refresh --quiet
-  ```
-
-> Lưu ý: `auth refresh` chỉ "gia hạn" một phiên **đang còn sống** — nếu
-> phiên đã hết hạn hoàn toàn, vẫn cần chạy `notebooklm login` lại một lần.
+Mã nguồn Python đã được thiết kế để theo dõi chặt chẽ tính toàn vẹn của kết nối. Khi nó nhận thấy kết nối tới Google thất bại (Authentication expired), nó sẽ trực tiếp kích hoạt lệnh trong file `login.bat` của bạn để gia hạn. Nhờ cơ chế tự động giữ phiên mới của công cụ dòng lệnh NotebookLM, mọi thứ sẽ diễn ra âm thầm trong nền. Bạn có thể thoải mái treo máy!
 
 ---
 
@@ -414,19 +324,6 @@ winget install --id JohnMacFarlane.Pandoc
 brew install pandoc
 ```
 
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt update && sudo apt install -y pandoc
-```
-**Linux (Fedora):**
-```bash
-sudo dnf install -y pandoc
-```
-**Linux (Arch):**
-```bash
-sudo pacman -S pandoc
-```
-
 Kiểm tra đã cài đúng:
 ```bash
 pandoc --version
@@ -445,20 +342,17 @@ python latex_to_equation.py ban_dich_hoan_chinh.docx ban_dich_final.docx
 
 ---
 
-## 10. Xử lý sự cố thường gặp
+## 10. Xử lý sự cố thường gặp (Troubleshooting)
 
-| Lỗi gặp phải | Nguyên nhân | Cách xử lý |
+Hầu hết các lỗi đã được tự động xử lý bởi mã nguồn, tuy nhiên đây là một số kịch bản bạn có thể theo dõi:
+
+| Sự cố | Hiện tượng & Nguyên nhân | Cách hệ thống hoặc bạn xử lý |
 |---|---|---|
-| `ModuleNotFoundError` | Quên kích hoạt `.venv` | `cd` vào thư mục dự án, kích hoạt lại venv |
-| `ValueError: Authentication expired` | Phiên NotebookLM hết hạn | `notebooklm login` lại (xem mục 8 để phòng ngừa) |
-| `Unexpected error: Authentication expired...` khi chạy `auth refresh` | Phiên đã hết hạn HOÀN TOÀN, không "gia hạn" được nữa | Phải `notebooklm login` lại trước, `auth refresh` chỉ cho phiên còn sống |
-| `ChatError: ... too large` | Câu hỏi gửi đi quá dài | Đã khắc phục (dùng nguồn `prompt.txt`/`automation_rules.txt` riêng thay vì nhồi vào chat) |
-| `RPCResponseTooLargeError` / `NetworkError` | Rất có thể nguồn đã hết và AI cố tìm internet, hoặc hội thoại quá dài | Script tự dừng an toàn — chạy lại; nếu lặp lại, dùng `--restart` |
-| `HttpError 400 Bad Request` khi đẩy Doc | Google Doc chạm giới hạn 1.024.000 ký tự | Đã tự động xử lý (tự mở Doc "Phần N" mới) |
-| Bản dịch bị lặp/nhảy cóc | Hội thoại quá dài, có thể chạm giới hạn context NotebookLM | `python translate_book.py --restart` |
-| Doc mới bị tạo thay vì nối tiếp Doc cũ | `checkpoint.json` bị thiếu (ví dụ chạy từ thư mục mới) | Copy đúng `checkpoint.json` từ thư mục cũ sang |
-| Câu trả lời thiếu khối "📌 Ghi chú hệ thống" | AI trả lời lỗi/cắt cụt giữa chừng | Script tự phục hồi — chỉ cần chạy `--restart` |
-| `pandoc: command not found` / `'pandoc' is not recognized` | Chưa cài `pandoc` cấp hệ điều hành (không nằm trong `requirements.txt`) | Cài theo hướng dẫn ở mục 9.2, sau đó mở lại terminal |
+| Mạng chập chờn, rớt kết nối mạng nội bộ | Báo lỗi kết nối Timeout | Script sẽ thử khởi động lại kết nối. Nếu nhà bạn mất mạng hoàn toàn, quá trình dịch sẽ tạm dừng cho đến khi bạn bật lại script. |
+| NotebookLM Server quá tải | Văng lỗi HTTP 500 hoặc NetworkError đột xuất | Script sẽ bắt lỗi, chờ và thực hiện tự động tạo phiên (Restart) hoặc gọi lại `login.bat` để làm tươi kết nối và tự động thử lại. |
+| Dùng chung tài khoản | Nếu người khác truy cập cùng lúc và huỷ phiên | Lỗi không xác thực. Script tự động gọi `login.bat` để xin lại Token. Vẫn giữ nguyên neo cũ không ảnh hưởng tài liệu. |
+| `RPCResponseTooLargeError` | AI tìm nguồn ngoài do nguồn tài liệu đã cạn | Tự động kích hoạt làm mới hội thoại; Nếu vẫn bị lặp lại liên tục, bạn cần kiểm tra file PDF gốc đã dịch đến trang cuối chưa và tiến hành cấp nguồn mới. |
+| `ModuleNotFoundError` | Quên kích hoạt `.venv` | Kích hoạt lại môi trường ảo: `.venv\Scripts\activate` hoặc `source .venv/bin/activate` |
 
 ---
 
@@ -468,32 +362,20 @@ python latex_to_equation.py ban_dich_hoan_chinh.docx ban_dich_final.docx
 |---|---|---|
 | `translate_book.py` | Script chính | Không tự sửa trừ khi đổi logic |
 | `config.json` | Cấu hình riêng từng sách | Sửa mỗi khi đổi sách |
+| `login.bat` | Script hỗ trợ lấy Token | Tạo một lần, để Script tự gọi lại khi cần |
 | `credentials.json` | OAuth Client Google Drive | Lấy 1 lần, dùng chung mọi sách |
 | `token.json` | Phiên đăng nhập Drive đã lưu | Tự sinh |
 | `checkpoint.json` | Tiến độ + `last_anchor` (câu neo tự cập nhật) | Tự sinh; sửa tay khi cần neo điểm khác |
 | `translation.md` | Toàn bộ bản dịch — **nguồn dữ liệu thật** | Tự sinh, tự sửa khi cần dịch chỉ định |
 | `translation.backup.md` | Bản sao lưu an toàn | Tự sinh |
 | `notes.log` | Câu neo tiếng Anh + đoạn tiếng Việt tương ứng mỗi vòng | Tự sinh |
-| `google_doc_link.txt` | Link Google Doc (mọi phần) | Tự sinh, tự nối thêm dòng khi tách Doc mới |
-| `automation_rules.txt` | Luật hệ thống (xuất ra để upload NotebookLM) | Tự sinh từ code |
-| `split.py` | Công cụ chia PDF | Dùng khi cần |
-| `latex_to_equation.py` | Công cụ chuyển LaTeX → Equation Word | Dùng khi cần |
-| `prompt.txt` | Vai trò dịch giả, định dạng riêng sách | **Không nằm trong thư mục này** — tự viết, tự upload lên NotebookLM |
 
 ---
 
 ## 12. Nguyên tắc nên nhớ
 
-- **Luôn theo dõi định kỳ** — dù có nhiều lớp tự động, không gì thay được
-  việc con người đọc lại Google Doc thường xuyên.
-- **`rounds_per_run` nhỏ khi chưa quen** — dễ phát hiện lỗi sớm hơn.
-- **Khi cần câu neo chính xác nhất, lấy nguyên văn từ PDF gốc** — AI đôi khi
-  tự "sửa" lỗi OCR ngay cả khi tự trích dẫn câu neo của chính nó.
+- **Luôn theo dõi định kỳ** — dù có nhiều lớp tự động, thi thoảng cũng nên liếc qua quá trình nó dịch xem mọi thứ có đi đúng hướng không.
+- **Lưu ý số lượng `rounds_before_refresh`** — Phải chắc chắn file cấu hình có dòng này để tránh tràn Memory / Context của NotebookLM.
 - **`translation.md`/`translation.backup.md` mới là nguồn thật** — Google
-  Doc chỉ là cửa sổ theo dõi tạm thời; nếu Doc có lệch/lỗi hiển thị, không
-  ảnh hưởng gì đến kết quả cuối (luôn xuất lại từ `translation.backup.md`
-  bằng `pandoc`).
+  Doc chỉ là cửa sổ theo dõi tạm thời. Dù quá trình đẩy lên Docs bị lỗi mạng, nội dung dịch vẫn được lưu 100% về ổ cứng của bạn trong MD file an toàn.
 - **Không cần Docker/máy ảo gì thêm** — `.venv` là đủ cho quy mô dự án này.
-  Ngoại lệ duy nhất là `pandoc` (mục 9.2) — chương trình cấp hệ điều hành,
-  cần cài riêng ngoài `.venv`, chỉ khi bạn dùng bước xuất `.docx`.
-- **Tuyệt đối không dùng `--master-token` với tài khoản Google chính.**
