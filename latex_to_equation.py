@@ -74,6 +74,25 @@ def clean_latex(latex: str) -> str:
     # ngoặc nhọn (đúng ra phải là '\left\{' / '\right\}'). Tự sửa an toàn vì
     # '\left{' không phải cú pháp LaTeX hợp lệ trong bất kỳ trường hợp nào.
     latex = latex.replace('\\left{', '\\left\\{').replace('\\right}', '\\right\\}')
+    # Loi pho bien thu ba: backslash bi NHAN DOI NHAM ngay truoc mot lenh
+    # LaTeX hoac dau mo nhom (artefact dich/OCR, giong loi thu nhat o tren).
+    # Chi hop le 2 backslash lien tiep khi dung lam ky hieu xuong dong trong
+    # ma tran/cases -- luc do luon theo sau boi khoang trang, '&', hoac cuoi
+    # chuoi, KHONG BAO GIO la chu cai/dau mo nhom. Nen chi gop 2 backslash
+    # thanh 1 khi ky tu theo sau la chu/so hoac mot trong ( ) [ ] { } %.
+    # Cap nhat: kiem chung tren chinh cuon sach nay cho thay '\\' KHONG
+    # bao gio la ky hieu xuong dong hang that (khong co moi truong ma tran
+    # '\begin{...}' nao trong cac cong thuc loi) -- moi truong hop deu la
+    # backslash bi nhan doi nham, ke ca khi theo sau la khoang trang (vd
+    # '100\\ \text{mm Hg}' dang le la '100\ \text{mm Hg}', dung lenh
+    # chen khoang trang co kiem soat '\ ' giua so va don vi). Nen gop MOI
+    # chuoi 2+ backslash lien tiep thanh 1, TRU KHI cong thuc co chua
+    # '\begin{' (co kha nang la ma tran/cases that su) -- luc do van chi
+    # gop truoc chu/so/dau mo nhom nhu cu, giu nguyen truoc khoang trang/&.
+    if '\begin{' in latex:
+        latex = re.sub(r'\\{2,}(?=[a-zA-Z0-9()\[\]{}%])', r'\\', latex)
+    else:
+        latex = re.sub(r'\\{2,}', r'\\', latex)
     return latex
 
 
@@ -226,6 +245,25 @@ def ensure_math_namespace(root):
     return new_root
 
 
+# XML 1.0 cam moi ky tu dieu khien tru tab (\x09), newline (\x0A), CR (\x0D).
+# Rac OCR tu NotebookLM thinh thoang lot cac byte nay (vd \x03) vao
+# translation.md -> pandoc chep nguyen vao document.xml -> lxml tu choi
+# parse voi loi "PCDATA invalid Char value N". Loc bo truoc khi parse:
+# chi mat vai byte khong the hien thi duoc trong Word, khong mat noi dung
+# van ban that su.
+_ILLEGAL_XML_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def sanitize_xml_bytes(raw: bytes) -> bytes:
+    text = raw.decode('utf-8', errors='replace')
+    cleaned, n = _ILLEGAL_XML_CHARS_RE.subn('', text)
+    if n:
+        print(f'  [CANH BAO] Da loc bo {n} ky tu dieu khien khong hop le '
+              f'(rac OCR) trong document.xml truoc khi parse',
+              file=sys.stderr)
+    return cleaned.encode('utf-8')
+
+
 def write_failure_report(failures: list, report_path: str):
     """Ghi ra danh sách công thức lỗi kèm câu văn xung quanh, để tìm bằng
     Ctrl+F trong Word — không cần LibreOffice/PDF, không cần tính số trang."""
@@ -248,8 +286,9 @@ def convert(input_path: str, output_path: str):
 
         doc_xml_path = os.path.join(extract_dir, 'word', 'document.xml')
         parser = etree.XMLParser(remove_blank_text=False)
-        tree = etree.parse(doc_xml_path, parser)
-        root = tree.getroot()
+        with open(doc_xml_path, 'rb') as f:
+            raw_xml = f.read()
+        root = etree.fromstring(sanitize_xml_bytes(raw_xml), parser)
         root = ensure_math_namespace(root)
 
         stats = {'converted': 0, 'failed': 0}

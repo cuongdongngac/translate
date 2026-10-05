@@ -36,18 +36,42 @@ CÁCH DÙNG:
            python translate_book.py --restart
        Muốn neo vào 1 điểm CŨ hơn: tự sửa tay trường "last_anchor" trong checkpoint.json
        trước khi chạy lệnh trên.
+
+    5) "BẮT ĐẦU TASK MỚI" — dùng khi đổi máy/tài khoản NotebookLM để tiếp tục dịch
+       cùng 1 cuốn sách (hoặc chủ động muốn mở lại từ điểm neo đã lưu). Hoạt động
+       Y HỆT mục 4 ở trên (mở hội thoại mới, neo vào last_anchor trong checkpoint.json,
+       KHÔNG còn bị chặn bởi book_finished/waiting_for_new_part cũ — đây chính là điểm
+       hay bị "liên đới tham số khác" trước đây), chỉ khác tên cờ cho rõ tình huống:
+       người dùng MỚI chỉ cần copy checkpoint.json (đã có sẵn last_anchor) sang, rồi
+       chạy:
+           python translate_book.py --start-from
+       Lượt đầu tiên bám vào last_anchor để mở hội thoại mới; các lượt sau quay lại
+       đúng chu trình bình thường (giống hệt khi dùng --restart). KHÔNG dùng --restart
+       và --start-from cùng lúc trong 1 lần chạy.
 """
 
 import argparse
 import asyncio
 import json
 import re
+import subprocess
+import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 from notebooklm import NotebookLMClient
-from notebooklm.exceptions import RPCResponseTooLargeError, NetworkError
+from notebooklm.exceptions import (
+    RPCResponseTooLargeError,
+    NetworkError,
+    AuthError,
+    HeadlessReauthError,
+    RateLimitError,
+    ChatResponseParseError,
+)
 
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -59,10 +83,17 @@ CONFIG_FILE = Path("config.json")         # <-- MỌI THỨ HAY ĐỔI (notebook
 OUTPUT_FILE = Path("translation.md")
 CHECKPOINT_FILE = Path("checkpoint.json")
 LOG_FILE = Path("notes.log")
+ERROR_LOG_FILE = Path("error.log")   # mọi lỗi (traceback đầy đủ) được ghi vào đây, kèm mốc thời gian — để không lỡ mất lỗi nào khi chạy nhiều vòng không ai canh màn hình
+RAW_LOG_FILE = Path("raw_answers.log")   # câu trả lời THÔ của NotebookLM, ghi ngay khi vừa nhận được — lưới an toàn cuối cùng khi NotebookLM không tuân theo automation_rules.txt nữa
 CREDENTIALS_FILE = Path("credentials.json")
 TOKEN_FILE = Path("token.json")
 DOC_LINK_FILE = Path("google_doc_link.txt")   # nơi lưu link Doc để bạn mở lại dễ dàng
 DOC_SAFE_CHAR_LIMIT = 900_000   # Google Docs giới hạn cứng 1.024.000 ký tự/tài liệu — chừa đệm an toàn
+RATE_LIMIT_DEFAULT_WAIT = 60     # giây - dùng khi NotebookLM không cho biết retry_after
+RATE_LIMIT_MAX_WAIT = 900        # giây - trần chờ tối đa (15 phút) dù retry_after lớn hơn
+MAX_CONSECUTIVE_RATE_LIMIT = 5   # số lần RateLimitError liên tiếp trước khi DỪNG hẳn (nghi hết credit/quota)
+MAX_CONSECUTIVE_AUTH_FAILURES = 3  # số lần relogin/lỗi mạng thất bại liên tiếp trước khi DỪNG hẳn
+MAX_CONSECUTIVE_NOTEBOOKLM_GLITCH = 5  # số lần NotebookLM "đơ"/trả lời rỗng liên tiếp trước khi DỪNG hẳn (không phải lỗi do bạn)
 BACKUP_FILE = Path("translation.backup.md")   # bản sao lưu tự động, cập nhật sau mỗi vòng thành công
 CUT_MARKER = "<!-- CUT_HERE -->"   # dán dòng này vào translation.md để đánh dấu điểm cắt, thay vì tự xoá tay
 ADDITIONAL_GUIDANCE_TITLE = "addition"   # tên nguồn KHẨN CẤP (tuỳ chọn) — thêm tay trên
@@ -176,8 +207,21 @@ def get_drive_service():
         creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                # token.json không dùng lại được nữa — hay gặp khi copy checkpoint/token
+                # sang máy khác hoặc đổi tài khoản Google, refresh token bị Google thu hồi
+                # hết hạn (invalid_grant). KHÔNG crash ở đây — quay về đăng nhập lại từ đầu
+                # (mở trình duyệt) như thể chưa từng có token.json, thay vì để traceback
+                # thô làm bạn tưởng lỗi nặng hơn thực tế.
+                print(
+                    f"-> {TOKEN_FILE} không dùng lại được nữa ({e}). Có thể do vừa đổi máy/"
+                    "tài khoản Google, hoặc refresh token đã bị thu hồi/hết hạn.\n"
+                    "-> Sẽ mở trình duyệt để đăng nhập lại Google Drive từ đầu...\n"
+                )
+                creds = None
+        if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
             creds = flow.run_local_server(port=0)
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
@@ -232,6 +276,10 @@ def load_checkpoint():
         state.setdefault("rounds_since_refresh", 0)  # tương thích ngược cho checkpoint cũ
         state.setdefault("last_anchor", None)        # tương thích ngược cho checkpoint cũ
         state.setdefault("last_progress_percent", None)  # tương thích ngược cho checkpoint cũ
+        state.setdefault("round", 0)                 # tương thích ngược - THIẾU dòng này chính là
+                                                      # nguyên nhân gây KeyError('round') từng bị
+                                                      # hiểu nhầm thành "Lỗi kết nối hoặc xác thực"
+        state.setdefault("doc_id", None)             # tương thích ngược (cùng lý do như trên)
         return state
     return {
         "conversation_id": None,
@@ -274,6 +322,17 @@ def append_log(footer_text, translation_text):
         f.write("\n")
 
 
+def log_error(context: str, exc: BaseException):
+    """Ghi traceback đầy đủ + mốc thời gian + bối cảnh vào error.log, để không
+    còn lỗi nào chỉ lướt qua console rồi mất — nhất là khi chạy --rounds lớn
+    (ví dụ 100) mà không ai ngồi canh màn hình."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with ERROR_LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"\n===== {timestamp} - {context} =====\n")
+        f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        f.write("\n")
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -295,6 +354,17 @@ async def main():
         )
     )
     parser.add_argument(
+        "--start-from", action="store_true",
+        help=(
+            "BẮT ĐẦU TASK MỚI: hoạt động Y HỆT --restart (mở hội thoại mới, neo vào "
+            "state['last_anchor'] trong checkpoint.json, không cần sửa tay gì) — chỉ "
+            "khác tên gọi, dùng cho tình huống đổi máy/tài khoản NotebookLM để tiếp "
+            "tục dịch cùng 1 cuốn sách: người dùng mới chỉ cần copy checkpoint.json "
+            "(đã có sẵn last_anchor) sang rồi chạy cờ này. Không dùng chung với "
+            "--restart trong cùng 1 lần chạy."
+        )
+    )
+    parser.add_argument(
         "--rounds", type=int, default=None, metavar="N",
         help=(
             "Số vòng dịch tối đa cho lần chạy này — ƯU TIÊN HƠN rounds_per_run trong "
@@ -306,24 +376,39 @@ async def main():
 
     state = load_checkpoint()
 
-    # DỊCH CHỈ ĐỊNH: kích hoạt bằng cờ --restart, dùng câu neo đã tự động lưu
-    # sẵn trong checkpoint.json (trường "last_anchor", cập nhật sau MỖI vòng
-    # thành công) — không cần file riêng, không cần tự tìm/copy trong notes.log.
     restart_anchor = None
     conversation_id_to_delete = None
-    if args.restart:
+
+    if args.restart and args.start_from:
+        print("Không thể dùng đồng thời --restart và --start-from — chỉ chọn một cờ cho mỗi lần chạy.")
+        return
+
+    # DỊCH CHỈ ĐỊNH / BẮT ĐẦU TASK MỚI: kích hoạt bằng --restart HOẶC --start-from —
+    # 2 cờ này dùng CHUNG một cơ chế bên dưới, chỉ khác tên cho rõ tình huống sử dụng
+    # (--start-from: đổi máy/tài khoản NotebookLM, chỉ cần copy checkpoint.json sang).
+    # Dùng câu neo đã tự động lưu sẵn trong checkpoint.json (trường "last_anchor",
+    # cập nhật sau MỖI vòng thành công) — không cần file riêng, không cần tự tìm/copy
+    # trong notes.log.
+    if args.restart or args.start_from:
         restart_anchor = state.get("last_anchor") or get_last_good_anchor()
         if not restart_anchor:
+            flag_name = "--restart" if args.restart else "--start-from"
             print(
-                "Bật --restart nhưng chưa có câu neo nào trong checkpoint.json "
+                f"Bật {flag_name} nhưng chưa có câu neo nào trong checkpoint.json "
                 "(trường last_anchor) và cũng không tìm thấy trong notes.log — "
                 "có thể đây là lần chạy đầu tiên, chưa có vòng nào thành công."
             )
             return
+        print(f"-> Chế độ DỊCH CHỈ ĐỊNH / BẮT ĐẦU TASK MỚI: sẽ tạo hội thoại mới, neo vào: \"{restart_anchor}\"\n")
+
+        # CHỦ ĐỘNG bỏ qua trạng thái book_finished/waiting_for_new_part CŨ (của vị trí
+        # trước đó): đây chính là chỗ hay "liên đới tham số khác" trước đây khiến việc
+        # dịch chỉ định bị chặn oan khi sách đã báo xong/đang chờ đổi phần.
         conversation_id_to_delete = state["conversation_id"]   # lưu lại để xoá thật sau khi có client
         state["conversation_id"] = None
         state["rounds_since_refresh"] = 0   # hội thoại mới -> đếm lại từ đầu
-        print(f"-> Chế độ DỊCH CHỈ ĐỊNH: sẽ tạo hội thoại mới, neo vào: \"{restart_anchor}\"\n")
+        state["waiting_for_new_part"] = False
+        state["book_finished"] = False
 
         # Nếu bạn đã dán dòng CUT_MARKER vào translation.md thay vì tự tay xoá,
         # script tự cắt bỏ mọi thứ TỪ dòng đó trở đi (không cần bạn tự xoá tay).
@@ -397,6 +482,10 @@ async def main():
     print(f"Sẽ dịch tối đa {rounds_per_run} đoạn trong lần chạy này...\n")
 
     rounds_completed = 0
+    consecutive_rate_limit_hits = 0
+    consecutive_auth_failures = 0
+    consecutive_network_failures = 0
+    consecutive_notebooklm_glitches = 0
 
     while rounds_completed < rounds_per_run:
         if state.get("book_finished") or state.get("waiting_for_new_part"):
@@ -477,7 +566,11 @@ async def main():
                             conversation_id=state["conversation_id"],
                         )
                     except (RPCResponseTooLargeError, NetworkError) as e:
-                        import traceback
+                        # KHÔNG "import traceback" cục bộ ở đây nữa: Python coi một tên được
+                        # gán/import ở BẤT KỲ đâu trong hàm là biến local của CẢ HÀM main(),
+                        # nên "import traceback" trong nhánh này từng làm traceback (đã import
+                        # sẵn ở đầu file) bị che mất tại các nhánh khác trong main() chưa từng
+                        # chạy qua đây trước -> UnboundLocalError. Dùng thẳng traceback module-level.
                         error_traceback = traceback.format_exc()
                         print(
                             "\n⚠️  NotebookLM phản hồi bất thường (quá lớn hoặc mất kết nối giữa chừng).\n"
@@ -494,8 +587,68 @@ async def main():
                         else:
                             print("Không tìm thấy điểm neo để restart! Dừng lại.")
                             return
+                    except ChatResponseParseError as e:
+                        # NotebookLM đang gặp sự cố TẠM THỜI PHÍA GOOGLE — KHÔNG PHẢI lỗi do
+                        # máy/tài khoản của bạn, cũng không phải bug của ứng dụng này. Bạn có
+                        # thể tự kiểm chứng: mở trang notebooklm.google.com, thường sẽ thấy dòng
+                        # chữ kiểu "I'm having trouble responding at the moment" ngay trên đó.
+                        # In thông báo NGẮN GỌN, KHÔNG kèm traceback kỹ thuật (để người không
+                        # rành IT vẫn đọc hiểu được và biết đây không phải lỗi cần tự sửa gì).
+                        consecutive_notebooklm_glitches += 1
+                        log_error(
+                            "NotebookLM tạm thời không phản hồi được (ChatResponseParseError) — "
+                            f"lần {consecutive_notebooklm_glitches}/{MAX_CONSECUTIVE_NOTEBOOKLM_GLITCH} liên tiếp",
+                            e,
+                        )
+                        print(
+                            "\n⚠️  NOTEBOOKLM ĐANG GẶP SỰ CỐ TẠM THỜI — đây KHÔNG PHẢI lỗi do máy/tài "
+                            "khoản của bạn, bạn KHÔNG CẦN sửa gì cả. Bạn có thể tự kiểm chứng bằng cách "
+                            "mở trang notebooklm.google.com, thường sẽ thấy dòng chữ kiểu \"I'm having "
+                            "trouble responding at the moment\" ngay trên đó.\n"
+                            f"-> Đợi một chút rồi TỰ ĐỘNG thử lại (lần {consecutive_notebooklm_glitches}/"
+                            f"{MAX_CONSECUTIVE_NOTEBOOKLM_GLITCH} liên tiếp)...\n"
+                        )
+                        if consecutive_notebooklm_glitches >= MAX_CONSECUTIVE_NOTEBOOKLM_GLITCH:
+                            print(
+                                f"-> NotebookLM gặp sự cố {MAX_CONSECUTIVE_NOTEBOOKLM_GLITCH} lần liên "
+                                "tiếp — DỪNG script lại để tránh thử vô ích. NHẮC LẠI: đây KHÔNG phải "
+                                "lỗi bạn cần sửa — cứ đợi một lúc (vài phút đến vài chục phút) rồi chạy "
+                                "lại 'python translate_book.py' như bình thường, không cần đổi tài "
+                                "khoản/máy hay sửa file nào."
+                            )
+                            return
+                        time.sleep(RATE_LIMIT_DEFAULT_WAIT)
+                        restart_anchor = state.get("last_anchor") or get_last_good_anchor()
+                        if restart_anchor:
+                            conversation_id_to_delete = state["conversation_id"]
+                            state["conversation_id"] = None
+                            state["rounds_since_refresh"] = 0
+                            save_checkpoint(state)
+                            break
+                        else:
+                            print("Không tìm thấy điểm neo để tự thử lại! Dừng lại.")
+                            return
                     except Exception as e:
                         raise e
+
+                    # Ghi NGAY câu trả lời THÔ ra raw_answers.log, TRƯỚC khi parse/xử lý gì cả —
+                    # lưới an toàn cuối cùng: NotebookLM đã thực sự sinh ra nội dung này rồi (đã
+                    # "tiêu" một lượt hội thoại), nên dù các bước sau (parse, ghi translation.md,
+                    # trích neo, đẩy Drive...) có lỗi/lệch gì đi nữa thì nội dung vẫn không bao
+                    # giờ mất — mở file này ra là có ngay để copy tay bù, đặc biệt hữu ích đúng
+                    # lúc NotebookLM không tuân theo automation_rules.txt nữa (thiếu/sai khối
+                    # "Ghi chú hệ thống") mà ứng dụng không thể ép nó tuân theo được.
+                    try:
+                        with RAW_LOG_FILE.open("a", encoding="utf-8") as f:
+                            f.write(
+                                f"\n===== round {state['round'] + 1} - "
+                                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - "
+                                f"conversation_id={result.conversation_id} =====\n"
+                            )
+                            f.write(str(result.answer))
+                            f.write("\n")
+                    except Exception as raw_log_exc:
+                        print(f"   (Cảnh báo: không ghi được {RAW_LOG_FILE}: {raw_log_exc} — bỏ qua, tiếp tục xử lý bình thường)")
 
                     translation_text, footer_text, part_done, footer_missing = parse_answer(result.answer)
                     if footer_missing:
@@ -526,6 +679,10 @@ async def main():
                     state["conversation_id"] = result.conversation_id
                     state["round"] += 1
                     rounds_completed += 1
+                    consecutive_rate_limit_hits = 0
+                    consecutive_auth_failures = 0
+                    consecutive_network_failures = 0
+                    consecutive_notebooklm_glitches = 0
 
                     append_translation(translation_text)
                     append_log(footer_text, translation_text)
@@ -533,6 +690,18 @@ async def main():
                     new_anchor = extract_anchor(footer_text)
                     if new_anchor:
                         state["last_anchor"] = new_anchor
+                    else:
+                        # Có khối "Ghi chú hệ thống" nhưng KHÔNG trích được câu neo (NotebookLM
+                        # có thể đã lệch định dạng automation_rules.txt — ứng dụng không có cách
+                        # nào ép nó tuân theo lại). Nội dung dịch vẫn được giữ đầy đủ (an toàn),
+                        # chỉ riêng last_anchor trong checkpoint.json tạm giữ giá trị CŨ — nếu cần
+                        # --restart/--start-from ngay sau lượt này, có thể dịch trùng một đoạn
+                        # ngắn (không mất nội dung, chỉ trùng, xem raw_answers.log để đối chiếu).
+                        print(
+                            f"   ⚠️  Vòng này có khối \"{FOOTER_TEXT_ANCHOR}\" nhưng KHÔNG trích "
+                            "được câu neo mới — last_anchor tạm giữ giá trị CŨ. Nội dung vẫn được "
+                            f"lưu đầy đủ vào {OUTPUT_FILE} và {RAW_LOG_FILE}."
+                        )
 
                     progress = extract_progress(footer_text)
                     if progress is not None:
@@ -559,6 +728,7 @@ async def main():
                         f"{doc_title} (Phần {state['doc_part_number']})"
                     )
 
+                    doc_id_before_push = state["doc_id"]
                     try:
                         new_doc_id = push_markdown_to_doc(
                             drive_service, state["doc_id"], part_doc_title, target_folder_id, segment
@@ -576,7 +746,78 @@ async def main():
                         else:
                             print(f"   -> xong ({len(translation_text)} ký tự đã đẩy lên Google Doc)")
                     except Exception as e:
-                        print(f"\n⚠️  Đẩy lên Google Doc bị lỗi: {e}\nBản dịch vẫn lưu an toàn nội bộ.\n")
+                        # CHỈ coi doc cũ là "hỏng vĩnh viễn" (xoá/đổi quyền/khác tài khoản) khi
+                        # Drive trả đúng lỗi 404 (không tìm thấy) hoặc 403 (không có quyền) — đây
+                        # là 2 mã lỗi ĐẶC TRƯNG cho trường hợp đó. Mọi lỗi khác (mất mạng thoáng
+                        # qua, Drive API quá tải/rate limit, timeout...) KHÔNG được coi là doc
+                        # hỏng — nếu không, mỗi lần mạng chập chờn sẽ tạo thêm 1 Doc MỚI, làm bản
+                        # dịch bị rải rác ra nhiều Doc một cách oan uổng. Với lỗi thoáng qua, GIỮ
+                        # NGUYÊN doc_id cũ để vòng sau tự thử lại đúng doc đó.
+                        status = getattr(getattr(e, "resp", None), "status", None)
+                        doc_permanently_unreachable = status in (403, 404)
+
+                        if doc_id_before_push is not None and doc_permanently_unreachable:
+                            log_error(f"Google Doc cũ ({doc_id_before_push}) không truy cập được (HTTP {status})", e)
+                            print(
+                                f"\n⚠️  Không đẩy được lên Google Doc cũ ({doc_id_before_push}) — HTTP {status}: {e}\n"
+                                "-> Đang tự động tạo Google Doc MỚI để không bị kẹt lại ở đây...\n"
+                            )
+                            # Thử tạo trong đúng target_folder_id trước; nếu CHÍNH cái thư mục đó
+                            # cũng không truy cập được với tài khoản hiện tại (rất có thể xảy ra
+                            # cùng lúc với lý do doc cũ không truy cập được — ví dụ vừa đổi tài
+                            # khoản Google), thử lại lần 2 KHÔNG kèm thư mục (tạo ở My Drive gốc)
+                            # để không bị kẹt lặp lại mãi ở cùng 1 lỗi mỗi vòng.
+                            new_doc_id = None
+                            last_create_error = None
+                            for attempt_folder in (target_folder_id, ""):
+                                try:
+                                    new_doc_id = push_markdown_to_doc(
+                                        drive_service, None, part_doc_title, attempt_folder, segment
+                                    )
+                                    if attempt_folder != target_folder_id:
+                                        print(
+                                            "   -> LƯU Ý: không tạo được Doc trong đúng thư mục đích "
+                                            f"(target_folder_id={target_folder_id!r}) — có thể thư mục này "
+                                            "cũng không truy cập được với tài khoản hiện tại. Đã tạo Doc "
+                                            "mới ở My Drive gốc thay thế, bạn tự chuyển thư mục lại bằng "
+                                            "tay nếu cần."
+                                        )
+                                    break
+                                except Exception as e2:
+                                    log_error(
+                                        f"Tạo Google Doc mới thất bại (target_folder_id={attempt_folder!r})", e2
+                                    )
+                                    last_create_error = e2
+
+                            if new_doc_id:
+                                state["doc_id"] = new_doc_id
+                                state["doc_offset"] = doc_offset
+                                save_checkpoint(state)
+                                BACKUP_FILE.write_text(full_content, encoding="utf-8")
+
+                                doc_link = f"https://docs.google.com/document/d/{state['doc_id']}/edit"
+                                with DOC_LINK_FILE.open("a", encoding="utf-8") as f:
+                                    f.write(
+                                        f"Phần {state.get('doc_part_number', 1)} "
+                                        f"(doc mới thay thế doc cũ {doc_id_before_push} không truy cập được): {doc_link}\n"
+                                    )
+                                print(f"   -> Đã tạo Google Doc MỚI thay thế: {doc_link}")
+                            else:
+                                print(
+                                    f"\n⚠️  Tạo Google Doc mới cũng thất bại (kể cả khi bỏ target_folder_id): "
+                                    f"{last_create_error}\nBản dịch vẫn lưu an toàn nội bộ trong {OUTPUT_FILE}. "
+                                    f"Xem chi tiết trong {ERROR_LOG_FILE}.\n"
+                                )
+                        else:
+                            log_error(
+                                "Đẩy lên Google Doc bị lỗi tạm thời/không xác định — GIỮ NGUYÊN doc_id cũ, "
+                                "sẽ tự thử lại vòng sau (không tạo doc mới)",
+                                e,
+                            )
+                            print(
+                                f"\n⚠️  Đẩy lên Google Doc bị lỗi (tạm thời — sẽ tự thử lại vòng sau, KHÔNG "
+                                f"tạo doc mới): {e}\nBản dịch vẫn lưu an toàn nội bộ.\n"
+                            )
 
                     state["rounds_since_refresh"] = state.get("rounds_since_refresh", 0) + 1
                     if rounds_before_refresh > 0 and state["rounds_since_refresh"] >= rounds_before_refresh:
@@ -605,14 +846,67 @@ async def main():
                             )
                         break
 
-        except Exception as e:
-            print(f"\n⚠️ Lỗi kết nối hoặc xác thực: {e}")
+        except RateLimitError as e:
+            consecutive_rate_limit_hits += 1
+            log_error("RateLimitError - có thể HẾT QUOTA/CREDIT của NotebookLM (không phải lỗi đăng nhập)", e)
+            wait_s = getattr(e, "retry_after", None) or RATE_LIMIT_DEFAULT_WAIT
+            wait_s = min(max(wait_s, 5), RATE_LIMIT_MAX_WAIT)
+            print(
+                f"\n⛔ NotebookLM báo HẾT QUOTA / bị giới hạn tốc độ (RateLimitError): {e}\n"
+                "   Đây KHÔNG phải lỗi đăng nhập — gọi login.bat sẽ không sửa được, "
+                "nên script sẽ KHÔNG relogin ở bước này.\n"
+                f"   -> Đợi {wait_s}s rồi thử lại "
+                f"(lần {consecutive_rate_limit_hits}/{MAX_CONSECUTIVE_RATE_LIMIT} liên tiếp)...\n"
+            )
+            if consecutive_rate_limit_hits >= MAX_CONSECUTIVE_RATE_LIMIT:
+                print(
+                    f"-> Đã bị RateLimitError {MAX_CONSECUTIVE_RATE_LIMIT} lần liên tiếp — DỪNG "
+                    f"script lại (xem chi tiết trong {ERROR_LOG_FILE}). Nhiều khả năng tài khoản "
+                    "đã hết quota/credit NotebookLM trong ngày hôm nay — đợi quota reset rồi chạy "
+                    "lại 'python translate_book.py'."
+                )
+                return
+            time.sleep(wait_s)
+
+        except (AuthError, HeadlessReauthError) as e:
+            consecutive_auth_failures += 1
+            log_error("Lỗi xác thực NotebookLM thật sự (AuthError/HeadlessReauthError)", e)
+            print(f"\n⚠️ Lỗi xác thực NotebookLM: {type(e).__name__}: {e}")
+            if consecutive_auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES:
+                print(
+                    f"-> Relogin thất bại {MAX_CONSECUTIVE_AUTH_FAILURES} lần liên tiếp — DỪNG "
+                    f"script lại (xem {ERROR_LOG_FILE}). Hãy tự chạy 'notebooklm login' bằng tay, "
+                    "kiểm tra tài khoản/trình duyệt, rồi chạy lại script."
+                )
+                return
             print("-> Tự động gọi login.bat để thử relogin...")
-            import subprocess
             subprocess.run(["login.bat"], shell=True)
             print("-> Đã relogin, đang thử lại...\n")
-            import time
             time.sleep(2)
+
+        except NetworkError as e:
+            consecutive_network_failures += 1
+            log_error("Lỗi mạng/kết nối (NetworkError, không phải auth)", e)
+            print(f"\n⚠️ Lỗi mạng/kết nối tạm thời: {type(e).__name__}: {e}")
+            if consecutive_network_failures >= MAX_CONSECUTIVE_AUTH_FAILURES:
+                print(
+                    f"-> Lỗi mạng {MAX_CONSECUTIVE_AUTH_FAILURES} lần liên tiếp — DỪNG script lại "
+                    f"(xem {ERROR_LOG_FILE}). Kiểm tra kết nối Internet rồi chạy lại script."
+                )
+                return
+            print("-> Đợi 10s rồi thử lại (không gọi login.bat vì đây không phải lỗi đăng nhập)...\n")
+            time.sleep(10)
+
+        except Exception as e:
+            log_error("Lỗi KHÔNG xác định - KHÔNG phải auth/rate-limit/network, dừng để tránh lặp vô ích", e)
+            print(
+                f"\n❌ LỖI KHÔNG PHẢI đăng nhập/kết nối — {type(e).__name__}: {e}\n"
+                f"Toàn bộ traceback đã được ghi vào {ERROR_LOG_FILE}.\n"
+                "Script DỪNG LẠI ở đây (không tự gọi login.bat/lặp lại vô ích, vì loại lỗi này "
+                "gọi lại cũng không tự hết) — sửa xong bug rồi chạy lại 'python translate_book.py'."
+            )
+            print(traceback.format_exc())
+            return
 
     if not state.get("book_finished") and not state.get("waiting_for_new_part"):
         progress_note = ""
